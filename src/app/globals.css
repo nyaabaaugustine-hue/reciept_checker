@@ -1,0 +1,215 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 168 80% 40%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 13% 47%;
+    --accent: 220 14% 96%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 168 80% 40%;
+    --radius: 0.75rem;
+    --chart-1: 168 80% 40%;
+    --chart-2: 168 70% 35%;
+    --chart-3: 168 60% 30%;
+    --chart-4: 190 50% 40%;
+    --chart-5: 210 50% 50%;
+  }
+
+  .dark {
+    --background: 222 47% 11%;
+    --foreground: 215 20% 65%;
+    --card: 222 24% 18%;
+    --card-foreground: 215 20% 65%;
+    --popover: 222 24% 18%;
+    --popover-foreground: 215 20% 65%;
+    --primary: 168 80% 40%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 222 24% 18%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 222 24% 18%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 168 80% 45%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 215 28% 21%;
+    --input: 215 28% 21%;
+    --ring: 168 80% 45%;
+  }
+}
+
+@layer base {
+  * { @apply border-border; box-sizing: border-box; }
+  
+  body {
+    @apply bg-background text-foreground;
+    /* Prevent iOS bounce / overscroll */
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+  }
+
+  /* ── MOBILE-FIRST: All interactive targets minimum 48px ── */
+  button, [role="button"], input, select, textarea, a {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+
+  /* Bigger base font for field readability */
+  html { font-size: 16px; }
+
+  /* Inputs feel native on mobile */
+  input, textarea, select {
+    font-size: 16px !important; /* prevent iOS zoom on focus */
+    border-radius: var(--radius);
+  }
+}
+
+/* ── MOBILE LAYOUT UTILITIES ─────────────────────────────── */
+@layer utilities {
+
+  /* Full-height safe area (notches, home bars) */
+  .h-screen-safe {
+    height: 100dvh;
+    height: calc(100vh - env(safe-area-inset-bottom));
+  }
+
+  .pb-safe { padding-bottom: env(safe-area-inset-bottom, 16px); }
+  .pt-safe { padding-top: env(safe-area-inset-top, 0px); }
+
+  /* Large tap targets — use everywhere buttons appear in lists */
+  .tap-target {
+    min-height: 52px;
+    min-width: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  /* Card padding scaled for mobile */
+  .card-mobile {
+    @apply p-3 sm:p-5;
+  }
+
+  /* Stack on mobile, side-by-side on desktop */
+  .mobile-stack {
+    @apply flex flex-col gap-3 sm:flex-row sm:items-center;
+  }
+
+  /* Full-width buttons on mobile */
+  .btn-full-mobile {
+    @apply w-full sm:w-auto;
+  }
+
+  /* Scrollable horizontal table on mobile */
+  .table-scroll {
+    @apply overflow-x-auto -mx-3 px-3;
+  }
+
+  /* Fade-in animations */
+  .animate-fade-in-up {
+    animation: fadeInUp 0.3s ease-out both;
+  }
+  .animate-fade-in-left {
+    animation: fadeInLeft 0.25s ease-out both;
+  }
+
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes fadeInLeft {
+    from { opacity: 0; transform: translateX(16px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+
+  /* ── Print ── */
+  @media print {
+    .no-print { display: none !important; }
+    main { padding: 0 !important; }
+    body { background-color: white; }
+    .print-container { width: 100%; max-width: 100%; padding: 0; margin: 0; }
+    .print-card { border: 1px solid #ccc; box-shadow: none; }
+  }
+}
+
+/* ── MOBILE NAV BAR (bottom action bar for field use) ───── */
+@layer components {
+
+  /* Big action buttons — salesman must be able to tap with one thumb */
+  .action-btn-primary {
+    @apply flex items-center justify-center gap-2 rounded-xl font-semibold text-base;
+    @apply bg-primary text-primary-foreground;
+    @apply min-h-[56px] px-5 w-full;
+    @apply active:scale-95 transition-transform;
+    touch-action: manipulation;
+  }
+
+  .action-btn-secondary {
+    @apply flex items-center justify-center gap-2 rounded-xl font-semibold text-base;
+    @apply border-2 border-primary text-primary bg-transparent;
+    @apply min-h-[56px] px-5 w-full;
+    @apply active:scale-95 transition-transform;
+    touch-action: manipulation;
+  }
+
+  .action-btn-danger {
+    @apply flex items-center justify-center gap-2 rounded-xl font-semibold text-base;
+    @apply bg-destructive text-destructive-foreground;
+    @apply min-h-[56px] px-5 w-full;
+    @apply active:scale-95 transition-transform;
+    touch-action: manipulation;
+  }
+
+  /* Status pill badges — large enough to read in sunlight */
+  .status-pill {
+    @apply inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-semibold;
+  }
+
+  /* Mobile card — larger padding, bigger text */
+  .invoice-card {
+    @apply bg-card rounded-2xl border shadow-sm p-4 space-y-2;
+  }
+
+  /* Bottom sticky action bar */
+  .bottom-bar {
+    @apply fixed bottom-0 left-0 right-0 z-50;
+    @apply bg-card/95 backdrop-blur border-t;
+    @apply flex gap-3 p-3;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  }
+
+  /* PWA install prompt */
+  .pwa-banner {
+    @apply fixed bottom-0 left-0 right-0 z-50;
+    @apply bg-primary text-primary-foreground;
+    @apply flex items-center justify-between gap-3 p-4;
+    padding-bottom: calc(16px + env(safe-area-inset-bottom));
+  }
+}
+
+/* ── SCROLLBAR ────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 99px; }
+
+/* ── PREVENT DOUBLE-TAP ZOOM on iOS ──────────────────────── */
+* { touch-action: manipulation; }
+input, textarea { touch-action: auto; }
