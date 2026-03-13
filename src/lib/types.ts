@@ -21,6 +21,19 @@ export interface ValidatedData {
 
 export type InvoiceStatus = 'verified' | 'error' | 'corrected' | 'approved' | 'rejected';
 
+// Protocol 9 — salesman risk verdict
+export type RiskVerdict = 'ACCEPT' | 'CAUTION' | 'REJECT' | 'ESCALATE';
+
+export interface RiskVerdictResult {
+  verdict: RiskVerdict;
+  // One plain-English sentence the salesman can act on immediately
+  reason: string;
+  // Secondary detail lines (shown collapsed, for supervisor review)
+  details: string[];
+  // Estimated money at risk from this single invoice (0 if ACCEPT)
+  moneyAtRisk: number;
+}
+
 export type InvoiceProcessingResult = {
   id: string;
   isValid: boolean;
@@ -47,6 +60,12 @@ export type InvoiceProcessingResult = {
   partialPaymentOriginalId?: string;
   // currency extracted by AI
   currency?: string;
+  // Protocol 6 — price spike warnings from vendor memory
+  priceWarnings?: string[];
+  // Protocol 8 — reconciliation re-read applied
+  reconciliationApplied?: boolean;
+  // Protocol 9 — salesman risk verdict
+  riskVerdict?: RiskVerdictResult;
 };
 
 export interface VendorProfile {

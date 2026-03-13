@@ -17,7 +17,8 @@ import {
   BookOpen, AlertTriangle, ShieldAlert, BadgeCheck,
   ThumbsUp, ThumbsDown, CalendarClock, StickyNote,
   RefreshCw, AlertOctagon, ChevronDown, ChevronUp,
-  Share2, MessageCircle, Calculator,
+  Share2, MessageCircle, Calculator, ShieldCheck,
+  Ban, AlertCircle, TrendingUp,
 } from 'lucide-react';
 import { ExportMenu } from './export-menu';
 
@@ -30,6 +31,42 @@ interface ResultsViewProps {
   onApprove: (id: string) => void;
   onReject: (id: string, reason: string) => void;
   currency?: string;
+}
+
+// ── CHECKLIST: what passed and what failed ──
+interface CheckItem {
+  label: string;
+  passed: boolean;
+  detail?: string;
+}
+
+function buildChecklist(result: InvoiceProcessingResult): CheckItem[] {
+  const d = result.validatedData;
+  const errorFields = new Set(result.errors.map(e => e.field));
+  const items: CheckItem[] = [];
+
+  // Core fields
+  items.push({ label: 'Invoice number', passed: !!d.invoice_number, detail: d.invoice_number ?? undefined });
+  items.push({ label: 'Vendor name', passed: !!d.customer_name, detail: d.customer_name ?? undefined });
+  items.push({ label: 'Invoice date', passed: !!d.date && !errorFields.has('date'), detail: d.date ?? undefined });
+  items.push({ label: 'Line items found', passed: !!(d.items && d.items.length > 0), detail: d.items?.length ? `${d.items.length} item${d.items.length !== 1 ? 's' : ''}` : undefined });
+
+  // Totals
+  items.push({ label: 'Grand total readable', passed: d.total !== undefined && !errorFields.has('total'), detail: d.total !== undefined ? d.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : undefined });
+  items.push({ label: 'Subtotal present', passed: d.subtotal !== undefined, detail: d.subtotal !== undefined ? d.subtotal.toFixed(2) : undefined });
+  items.push({ label: 'Tax present', passed: d.tax !== undefined, detail: d.tax !== undefined ? d.tax.toFixed(2) : undefined });
+
+  // Maths
+  items.push({ label: 'Line items maths correct', passed: !result.errors.some(e => e.field.includes('line_total')) });
+  items.push({ label: 'Subtotal + tax = total', passed: !errorFields.has('math') && !errorFields.has('hallucination') });
+
+  // Integrity
+  items.push({ label: 'Not a duplicate', passed: !result.isDuplicate });
+  items.push({ label: 'Not a partial payment', passed: !result.isPartialPayment });
+  items.push({ label: 'No price spikes', passed: !(result.priceWarnings && result.priceWarnings.length > 0) });
+  items.push({ label: 'AI reading confidence', passed: !result.errors.some(e => e.message.includes('confidence')) });
+
+  return items;
 }
 
 function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors'], isValid: boolean) {
@@ -86,6 +123,14 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
   return { headline, paragraphs, warnings, actions };
 }
 
+// ── VERDICT CONFIG ──
+const VERDICT_CONFIG = {
+  ACCEPT:  { bg: 'bg-green-600',  border: 'border-green-500',  text: 'text-green-700 dark:text-green-300',  icon: ShieldCheck,  label: '🟢 ACCEPT — Collect the money'    },
+  CAUTION: { bg: 'bg-amber-500',  border: 'border-amber-400',  text: 'text-amber-700 dark:text-amber-300',  icon: AlertCircle,  label: '🟡 CAUTION — Review before collecting' },
+  REJECT:  { bg: 'bg-red-600',    border: 'border-red-500',    text: 'text-red-700 dark:text-red-300',      icon: Ban,          label: '🔴 REJECT — Do NOT collect money'  },
+  ESCALATE:{ bg: 'bg-orange-600', border: 'border-orange-500', text: 'text-orange-700 dark:text-orange-300',icon: TrendingUp,   label: '🟠 ESCALATE — Call your manager'   },
+} as const;
+
 export const ResultsView = ({
   result, onReset, onUpdate, onNotesUpdate, onDueDateUpdate, onApprove, onReject, currency = 'GHS',
 }: ResultsViewProps) => {
@@ -119,10 +164,10 @@ export const ResultsView = ({
   }, [editedData]);
 
   const story = useMemo(() => buildStory(editedData, result.errors, result.isValid), [editedData, result.errors, result.isValid]);
+  const checklist = useMemo(() => buildChecklist(result), [result]);
   const health = healthLabel(result.healthScore ?? calcHealthScore(result));
   const dueDays = daysUntilDue(dueDate || result.dueDate);
 
-  // #22 — suggested correct total when mismatch detected
   const suggestedTotal = useMemo(() => {
     const sub = editedData.subtotal;
     const tax = editedData.tax;
@@ -130,6 +175,7 @@ export const ResultsView = ({
     const itemSum = (editedData.items || []).reduce((s, i) => s + (i.line_total || 0), 0);
     return itemSum || undefined;
   }, [editedData]);
+
   const dueStatus = dueDateStatus(dueDays);
   const fmt = (n: number) => n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -175,27 +221,47 @@ export const ResultsView = ({
   const isRejected = result.status === 'rejected';
   const canAct = !isApproved && !isRejected;
 
-  // ── VERDICT COLOURS ──
-  const verdictBg = isApproved ? 'bg-blue-600' : isRejected ? 'bg-gray-500' : result.isValid ? 'bg-green-600' : 'bg-red-600';
-  const verdictText = isApproved ? 'Approved — Safe to Collect' : isRejected ? 'Invoice Rejected' : result.isValid ? '✅ Verified — Collect Payment' : '⛔ Errors — Do NOT Accept';
+  // Verdict
+  const verdict = result.riskVerdict?.verdict ?? (result.isValid ? 'ACCEPT' : 'REJECT');
+  const verdictCfg = VERDICT_CONFIG[verdict];
+  const VerdictIcon = verdictCfg.icon;
+
+  // Top banner colours (legacy fallback for approved/rejected state)
+  const verdictBg = isApproved ? 'bg-blue-600' : isRejected ? 'bg-gray-500' : verdictCfg.bg;
+  const verdictText = isApproved ? 'Approved — Safe to Collect' : isRejected ? 'Invoice Rejected' : verdictCfg.label;
+
+  const passedCount = checklist.filter(c => c.passed).length;
+  const failedCount = checklist.filter(c => !c.passed).length;
 
   return (
-    // Extra bottom padding so sticky bar doesn't cover content
     <div className="w-full space-y-4 animate-fade-in-up pb-36">
 
-      {/* ── VERDICT BANNER — full width, huge, unmissable ── */}
+      {/* ── VERDICT BANNER ── */}
       <div className={`rounded-2xl ${verdictBg} text-white p-5 space-y-2`}>
-        <p className="text-xl font-black leading-tight">{verdictText}</p>
-        <p className="text-sm opacity-90 leading-snug">{story.headline}</p>
+        <div className="flex items-center gap-2">
+          <VerdictIcon className="h-7 w-7 flex-shrink-0" />
+          <p className="text-xl font-black leading-tight">{verdictText}</p>
+        </div>
+        {/* Plain-English reason from Protocol 9 */}
+        {result.riskVerdict && (
+          <p className="text-sm font-semibold opacity-95 leading-snug bg-black/20 rounded-xl px-3 py-2">
+            {result.riskVerdict.reason}
+          </p>
+        )}
+        <p className="text-sm opacity-85 leading-snug">{story.headline}</p>
 
-        {/* Health + badges row */}
         <div className="flex flex-wrap gap-2 pt-1">
-          <span className={`text-xs font-bold px-3 py-1 rounded-full bg-white/20`}>
+          <span className="text-xs font-bold px-3 py-1 rounded-full bg-white/20">
             Health {result.healthScore ?? calcHealthScore(result)}/100 — {health.label}
           </span>
           {result.isDuplicate && (
             <span className="text-xs font-bold px-3 py-1 rounded-full bg-red-900/60 flex items-center gap-1">
               <AlertOctagon className="h-3 w-3" /> DUPLICATE
+            </span>
+          )}
+          {result.reconciliationApplied && (
+            <span className="text-xs font-bold px-3 py-1 rounded-full bg-white/20 flex items-center gap-1">
+              ✅ Re-verified
             </span>
           )}
           {result.isRecurring && (
@@ -218,12 +284,107 @@ export const ResultsView = ({
         </div>
       </div>
 
-      {/* ── HEALTH SCORE BREAKDOWN BADGE (#27) ── */}
+      {/* ── HEALTH SCORE BREAKDOWN BADGE ── */}
       <div className="flex flex-wrap gap-2">
         <HealthScoreBadge result={result} />
       </div>
 
-      {/* ── PARTIAL PAYMENT ALERT (#30) ── */}
+      {/* ── CHECKLIST: GREEN TICKS + RED X's ── */}
+      <div className="rounded-2xl border-2 border-border bg-card overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/50">
+          <span className="font-bold text-base flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5 text-primary" />
+            Invoice Check
+          </span>
+          <div className="flex items-center gap-3 text-sm">
+            <span className="flex items-center gap-1 font-bold text-green-600">
+              <CheckCircle className="h-4 w-4" /> {passedCount} passed
+            </span>
+            {failedCount > 0 && (
+              <span className="flex items-center gap-1 font-bold text-red-600">
+                <XCircle className="h-4 w-4" /> {failedCount} failed
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Checklist rows */}
+        <div className="divide-y divide-border">
+          {checklist.map((item, i) => (
+            <div
+              key={i}
+              className={cn(
+                'flex items-center gap-3 px-4 py-3',
+                item.passed
+                  ? 'bg-green-50/60 dark:bg-green-950/20'
+                  : 'bg-red-50/70 dark:bg-red-950/25'
+              )}
+            >
+              {item.passed
+                ? <CheckCircle className="h-5 w-5 text-green-600 flex-shrink-0" />
+                : <XCircle className="h-5 w-5 text-red-500 flex-shrink-0" />
+              }
+              <div className="flex-1 min-w-0">
+                <span className={cn(
+                  'text-sm font-semibold',
+                  item.passed ? 'text-green-800 dark:text-green-300' : 'text-red-800 dark:text-red-300'
+                )}>
+                  {item.label}
+                </span>
+                {item.passed && item.detail && (
+                  <span className="ml-2 text-xs text-green-700 dark:text-green-400 font-mono truncate">
+                    {item.detail}
+                  </span>
+                )}
+              </div>
+              {item.passed
+                ? <span className="text-xs font-bold text-green-600 bg-green-100 dark:bg-green-900/40 px-2 py-0.5 rounded-full flex-shrink-0">✓ OK</span>
+                : <span className="text-xs font-bold text-red-600 bg-red-100 dark:bg-red-900/40 px-2 py-0.5 rounded-full flex-shrink-0">✗ FAIL</span>
+              }
+            </div>
+          ))}
+        </div>
+
+        {/* All passed footer */}
+        {failedCount === 0 && (
+          <div className="px-4 py-3 bg-green-100 dark:bg-green-900/30 border-t border-green-200 dark:border-green-800">
+            <p className="text-sm font-bold text-green-700 dark:text-green-300 flex items-center gap-2">
+              <CheckCircle className="h-5 w-5" /> All checks passed — invoice is clean
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* ── ERRORS LIST (only shown when there are failures) ── */}
+      {!result.isValid && result.errors.length > 0 && (
+        <div className="rounded-2xl border-2 border-red-400 bg-red-50 dark:bg-red-950/30 overflow-hidden">
+          <div className="flex items-center justify-between p-4 border-b border-red-200 dark:border-red-800">
+            <div className="flex items-center gap-2">
+              <XCircle className="h-6 w-6 text-red-600" />
+              <span className="font-bold text-red-700 dark:text-red-400 text-base">
+                {result.errors.length} Error{result.errors.length !== 1 ? 's' : ''} Found
+              </span>
+            </div>
+            <button
+              className="text-xs text-muted-foreground flex items-center gap-1 px-3 py-2 rounded-xl border active:scale-95"
+              onClick={() => { navigator.clipboard.writeText(result.errors.map(e => e.message).join('\n')); toast({ title: 'Copied' }); }}
+            >
+              <Copy className="h-3 w-3" /> Copy
+            </button>
+          </div>
+          <div className="p-3 space-y-2">
+            {result.errors.map((err, i) => (
+              <div key={i} className="flex items-start gap-3 bg-white dark:bg-red-950/40 rounded-xl p-3 border border-red-200 dark:border-red-800">
+                <XCircle className="h-5 w-5 text-red-500 flex-shrink-0 mt-0.5" />
+                <p className="text-sm text-red-800 dark:text-red-200 leading-snug">{err.message}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── PARTIAL PAYMENT ALERT ── */}
       {result.isPartialPayment && result.partialPaymentOriginalTotal !== undefined && (
         <div className="rounded-2xl border-2 border-yellow-400 bg-yellow-50 dark:bg-yellow-950/30 p-4 flex items-start gap-3">
           <Calculator className="h-6 w-6 text-yellow-600 flex-shrink-0 mt-0.5" />
@@ -243,12 +404,12 @@ export const ResultsView = ({
           <AlertOctagon className="h-7 w-7 text-red-600 flex-shrink-0" />
           <div>
             <p className="font-black text-red-700 dark:text-red-400 text-base">Duplicate Invoice!</p>
-            <p className="text-sm text-red-600 dark:text-red-300 mt-1">This invoice matches one already in your history. Do NOT collect payment twice — contact the customer immediately.</p>
+            <p className="text-sm text-red-600 dark:text-red-300 mt-1">This invoice matches one already in your history. Do NOT collect payment twice.</p>
           </div>
         </div>
       )}
 
-      {/* ── SUGGESTED CORRECT TOTAL (#22) ── */}
+      {/* ── SUGGESTED CORRECT TOTAL ── */}
       {!result.isValid && suggestedTotal !== undefined && editedData.total !== undefined && Math.abs(suggestedTotal - editedData.total) > 0.01 && (
         <div className="rounded-2xl border-2 border-blue-300 bg-blue-50 dark:bg-blue-950/30 p-4 flex items-center justify-between gap-3">
           <div>
@@ -259,26 +420,20 @@ export const ResultsView = ({
         </div>
       )}
 
-      {/* ── ERROR LIST ── */}
-      {!result.isValid && result.errors.length > 0 && (
-        <div className="rounded-2xl border-2 border-red-400 bg-red-50 dark:bg-red-950/30 overflow-hidden">
-          <div className="flex items-center justify-between p-4 border-b border-red-200 dark:border-red-800">
-            <div className="flex items-center gap-2">
-              <XCircle className="h-6 w-6 text-red-600" />
-              <span className="font-bold text-red-700 dark:text-red-400 text-base">{result.errors.length} Error{result.errors.length !== 1 ? 's' : ''} Found</span>
-            </div>
-            <button
-              className="text-xs text-muted-foreground flex items-center gap-1 px-3 py-2 rounded-xl border active:scale-95"
-              onClick={() => { navigator.clipboard.writeText(result.errors.map(e => e.message).join('\n')); toast({ title: 'Copied' }); }}
-            >
-              <Copy className="h-3 w-3" /> Copy
-            </button>
+      {/* ── PROTOCOL 9 VERDICT DETAILS (expandable) ── */}
+      {result.riskVerdict && result.riskVerdict.details.length > 0 && (
+        <div className={cn('rounded-2xl border-2 overflow-hidden', verdictCfg.border)}>
+          <div className={cn('px-4 py-3 border-b', verdictCfg.border)}>
+            <p className={cn('font-bold text-sm flex items-center gap-2', verdictCfg.text)}>
+              <VerdictIcon className="h-4 w-4" />
+              Why this verdict — detail for supervisor
+            </p>
           </div>
-          <div className="p-3 space-y-2">
-            {result.errors.map((err, i) => (
-              <div key={i} className="flex items-start gap-3 bg-white dark:bg-red-950/40 rounded-xl p-3 border border-red-200 dark:border-red-800">
-                <XCircle className="h-5 w-5 text-red-500 flex-shrink-0 mt-0.5" />
-                <p className="text-sm text-red-800 dark:text-red-200 leading-snug">{err.message}</p>
+          <div className="p-3 space-y-2 bg-card">
+            {result.riskVerdict.details.map((d, i) => (
+              <div key={i} className="flex items-start gap-2 text-sm">
+                <XCircle className="h-4 w-4 text-red-500 flex-shrink-0 mt-0.5" />
+                <span className="leading-snug text-foreground/80">{d}</span>
               </div>
             ))}
           </div>
@@ -322,12 +477,7 @@ export const ResultsView = ({
       <div className="rounded-2xl border bg-card p-4 space-y-2">
         <p className="font-semibold flex items-center gap-2 text-sm"><CalendarClock className="h-5 w-5 text-primary" /> Payment Due Date</p>
         <div className="flex gap-2">
-          <Input
-            type="date"
-            value={dueDate}
-            onChange={e => setDueDate(e.target.value)}
-            className="flex-1 h-12 rounded-xl text-base"
-          />
+          <Input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} className="flex-1 h-12 rounded-xl text-base" />
           <button className="action-btn-primary !w-auto !min-w-[72px] !flex-none" onClick={handleDueDateSave}>Set</button>
         </div>
       </div>
@@ -335,13 +485,7 @@ export const ResultsView = ({
       {/* ── NOTES ── */}
       <div className="rounded-2xl border bg-card p-4 space-y-2">
         <p className="font-semibold flex items-center gap-2 text-sm"><StickyNote className="h-5 w-5 text-primary" /> Quick Notes</p>
-        <Textarea
-          value={notes}
-          onChange={e => setNotes(e.target.value)}
-          placeholder="e.g. Confirm with manager, check price list..."
-          className="rounded-xl text-base resize-none"
-          rows={2}
-        />
+        <Textarea value={notes} onChange={e => setNotes(e.target.value)} placeholder="e.g. Confirm with manager, check price list..." className="rounded-xl text-base resize-none" rows={2} />
         <button className="action-btn-secondary !min-h-[48px]" onClick={handleNotesSave}>Save Note</button>
       </div>
 
@@ -352,13 +496,16 @@ export const ResultsView = ({
           style={{ minHeight: 56 }}
           onClick={() => setShowDetails(v => !v)}
         >
-          <span className="font-semibold flex items-center gap-2"><FileText className="h-5 w-5 text-primary" /> Extracted Invoice Data {isEditing && <Badge variant="outline" className="text-orange-600 border-orange-400 text-xs">Unsaved</Badge>}</span>
+          <span className="font-semibold flex items-center gap-2">
+            <FileText className="h-5 w-5 text-primary" />
+            Extracted Invoice Data
+            {isEditing && <Badge variant="outline" className="text-orange-600 border-orange-400 text-xs">Unsaved</Badge>}
+          </span>
           {showDetails ? <ChevronUp className="h-5 w-5 text-muted-foreground" /> : <ChevronDown className="h-5 w-5 text-muted-foreground" />}
         </button>
 
         {showDetails && (
           <div className="px-4 pb-4 space-y-4 border-t">
-            {/* Fields */}
             <div className="grid grid-cols-2 gap-3 pt-3">
               <div className="space-y-1">
                 <label className="text-xs font-medium text-muted-foreground">Invoice #</label>
@@ -378,7 +525,7 @@ export const ResultsView = ({
               <Input value={editedData.category || ''} onChange={e => handleFieldChange('category', e.target.value)} className="h-12 text-base rounded-xl" />
             </div>
 
-            {/* Line items — scrollable table on mobile */}
+            {/* Line items */}
             <div>
               <p className="text-sm font-semibold mb-2">Line Items</p>
               <div className="overflow-x-auto rounded-xl border">
@@ -440,14 +587,12 @@ export const ResultsView = ({
               ))}
             </div>
 
-            {/* Save edits */}
             {isEditing && (
               <button className="action-btn-primary" onClick={handleSave}>
                 <CheckCircle className="h-5 w-5" /> Save Changes
               </button>
             )}
 
-            {/* Export */}
             <div className="pt-1">
               <ExportMenu data={editedData} />
             </div>
@@ -455,7 +600,7 @@ export const ResultsView = ({
         )}
       </div>
 
-      {/* ── SHARE BUTTONS (#39–#41) ── */}
+      {/* ── SHARE BUTTONS ── */}
       <div className="rounded-2xl border bg-card p-4 space-y-2">
         <p className="font-semibold text-sm flex items-center gap-2"><Share2 className="h-4 w-4 text-primary" /> Share This Invoice</p>
         <div className="flex gap-2">
@@ -496,7 +641,7 @@ export const ResultsView = ({
         )}
       </div>
 
-      {/* ── REJECT REASON INPUT (appears when tapping Reject) ── */}
+      {/* ── REJECT REASON INPUT ── */}
       {showRejectInput && (
         <div className="rounded-2xl border-2 border-red-400 bg-red-50 dark:bg-red-950/30 p-4 space-y-3">
           <p className="font-bold text-red-700 dark:text-red-400">Why are you rejecting this invoice?</p>
@@ -511,14 +656,12 @@ export const ResultsView = ({
             <button className="action-btn-danger flex-1" onClick={handleRejectConfirm}>
               <ThumbsDown className="h-5 w-5" /> Confirm Reject
             </button>
-            <button className="action-btn-secondary flex-1" onClick={() => setShowRejectInput(false)}>
-              Cancel
-            </button>
+            <button className="action-btn-secondary flex-1" onClick={() => setShowRejectInput(false)}>Cancel</button>
           </div>
         </div>
       )}
 
-      {/* ── STICKY APPROVE / REJECT BAR — sits above the main bottom bar ── */}
+      {/* ── STICKY APPROVE / REJECT BAR ── */}
       {canAct && !showRejectInput && (
         <div
           className="fixed left-0 right-0 z-40 no-print"
@@ -544,7 +687,7 @@ export const ResultsView = ({
         </div>
       )}
 
-      {/* Approved / rejected confirmation badge */}
+      {/* Approved/rejected confirmation */}
       {!canAct && (
         <div className={`rounded-2xl p-4 text-center font-bold text-lg ${isApproved ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'}`}>
           {isApproved ? '✅ Approved' : '❌ Rejected'}

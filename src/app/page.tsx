@@ -15,18 +15,17 @@ import { SettingsPanel } from '@/components/app/settings-panel';
 import { PinLockScreen } from '@/components/app/pin-lock-screen';
 import type { InvoiceProcessingResult, ValidatedData } from '@/lib/types';
 import {
-  detectDuplicate, detectRecurring, buildVendorProfiles,
-  checkPriceMemory, calcHealthScore,
+  calcHealthScore,
   getOfflineQueue, removeFromOfflineQueue, addToOfflineQueue,
   preprocessImage, checkImageQuality,
-  detectPartialPayment, checkRiskThreshold,
+  checkRiskThreshold,
 } from '@/lib/invoice-intelligence';
 import { exportAllHistory, importHistory } from '@/lib/utils';
-import { Camera, Upload, History, LayoutDashboard, X, AlertTriangle } from 'lucide-react';
+import { Camera, Upload, History, LayoutDashboard, X } from 'lucide-react';
 
 type ViewState = 'dashboard' | 'processing' | 'results';
 
-// Skeleton loader for history items (#63)
+// Skeleton loader for history items
 const HistorySkeletons = () => (
   <div className="space-y-2 p-3">
     {[1, 2, 3].map(i => (
@@ -43,6 +42,8 @@ const HistorySkeletons = () => (
 
 export default function HomePage() {
   const [history, setHistory] = useLocalStorage<InvoiceProcessingResult[]>('invoice-history', []);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
   const [settings, setSettings] = useSettings();
   const [view, setView] = useState<ViewState>('dashboard');
   const [activeResult, setActiveResult] = useState<InvoiceProcessingResult | null>(null);
@@ -60,7 +61,7 @@ export default function HomePage() {
   const wakeLockRef = useRef<any>(null);
   const { toast } = useToast();
 
-  // ── PIN LOCK: check on mount (#57) ──
+  // ── PIN LOCK ──
   const pinRequired = settings.pinEnabled && settings.pinHash && !isUnlocked;
 
   // ── PWA install prompt ──
@@ -92,18 +93,16 @@ export default function HomePage() {
     };
   }, []);// eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── #55 — Background sync: listen for SW message ──
+  // ── Background sync: listen for SW message ──
   useEffect(() => {
     const handleMessage = (e: MessageEvent) => {
-      if (e.data?.type === 'PROCESS_OFFLINE_QUEUE') {
-        processOfflineQueue();
-      }
+      if (e.data?.type === 'PROCESS_OFFLINE_QUEUE') processOfflineQueue();
     };
     navigator.serviceWorker?.addEventListener('message', handleMessage);
     return () => navigator.serviceWorker?.removeEventListener('message', handleMessage);
   }, []);// eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── #36 — Risk threshold check whenever history changes ──
+  // ── Risk threshold check whenever history changes ──
   useEffect(() => {
     if (!settings.riskThreshold) return;
     const { exceeded, atRisk, threshold } = checkRiskThreshold(history, settings.riskThreshold);
@@ -130,7 +129,7 @@ export default function HomePage() {
     }
   }, []);// eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── #54 — Screen wake lock while camera is open ──
+  // ── Screen wake lock while camera is open ──
   useEffect(() => {
     if (isCameraOpen && 'wakeLock' in navigator) {
       navigator.wakeLock.request('screen').then(lock => { wakeLockRef.current = lock; }).catch(() => {});
@@ -140,11 +139,16 @@ export default function HomePage() {
     }
   }, [isCameraOpen]);
 
+  // ─────────────────────────────────────────────────────────────
+  // MAIN SUBMIT FUNCTION
+  // All 9 protocols now run server-side inside processInvoice().
+  // history is passed so the server can run Protocols 6 & 7.
+  // ─────────────────────────────────────────────────────────────
   const submitImage = async (imageUri: string): Promise<InvoiceProcessingResult | null> => {
     setView('processing');
     setProcessingStatus('Checking image quality…');
 
-    // #3 — quality gate
+    // Image quality gate (client-side, fast)
     const quality = await checkImageQuality(imageUri);
     if (!quality.ok) {
       setView('dashboard');
@@ -153,13 +157,13 @@ export default function HomePage() {
     }
 
     setProcessingStatus('Optimising image…');
-    // #1 — preprocess: resize + contrast
     const optimised = await preprocessImage(imageUri);
 
-    setProcessingStatus('Reading invoice with AI…');
+    setProcessingStatus('Reading invoice with AI — this may take a moment…');
     let result: InvoiceProcessingResult;
     try {
-      result = await processInvoice(optimised, settings.taxRatePct);
+      // Pass history so server runs Protocol 6 (price memory) & Protocol 7 (duplicate/partial)
+      result = await processInvoice(optimised, settings.taxRatePct, history);
     } catch (error: any) {
       const raw: string = error?.message ?? '';
       const friendly = raw.replace('Invoice processing failed: ', '').replace('Error: ', '')
@@ -169,41 +173,79 @@ export default function HomePage() {
       return null;
     }
 
-    setProcessingStatus('Analysing for duplicates and patterns…');
+    setProcessingStatus('Finalising analysis…');
 
-    // Client-side enrichment
-    const dupCheck = detectDuplicate(result, history);
-    result.isDuplicate = dupCheck.isDuplicate;
-    result.duplicateOfId = dupCheck.duplicateOfId;
-
-    // #30 — partial payment
-    const partial = detectPartialPayment(result, history);
-    result.isPartialPayment = partial.isPartial;
-    result.partialPaymentOriginalTotal = partial.originalTotal;
-    result.partialPaymentOriginalId = partial.originalId;
-
-    const profiles = buildVendorProfiles(history);
-    const profile = result.vendorKey ? profiles[result.vendorKey] : undefined;
-    const recurring = detectRecurring(result, profile);
-    result.isRecurring = recurring.isRecurring;
-    result.recurringDelta = recurring.recurringDelta;
-
-    const priceWarnings = checkPriceMemory(result, profile);
-    for (const w of priceWarnings) {
-      result.errors = [...result.errors, { field: 'price_memory', message: w }];
-      result.isValid = false;
-      if (result.status === 'verified') result.status = 'error';
-    }
+    // Recalculate health score with all server-enriched fields now present
     result.healthScore = calcHealthScore(result);
 
+    // ── Protocol 9: surface the risk verdict as a prominent toast ──
+    const verdict = result.riskVerdict;
+    if (verdict) {
+      if (verdict.verdict === 'REJECT') {
+        toast({
+          variant: 'destructive',
+          title: '🔴 REJECT — Do NOT collect money',
+          description: verdict.reason,
+          duration: 15000,
+        });
+      } else if (verdict.verdict === 'ESCALATE') {
+        toast({
+          variant: 'destructive',
+          title: '🟠 ESCALATE — Call your manager',
+          description: verdict.reason,
+          duration: 15000,
+        });
+      } else if (verdict.verdict === 'CAUTION') {
+        toast({
+          title: '🟡 CAUTION — Review before collecting',
+          description: verdict.reason,
+          duration: 10000,
+        });
+      } else {
+        // ACCEPT
+        toast({
+          title: '🟢 ACCEPT — Safe to collect',
+          description: verdict.reason,
+          duration: 8000,
+        });
+      }
+    }
+
+    // ── Protocol 7: additional toasts for duplicate / partial ──
     if (result.isDuplicate) {
-      toast({ variant: 'destructive', title: '⚠️ Duplicate Invoice!', description: 'This matches one already scanned. Do NOT collect payment twice.', duration: 10000 });
+      toast({
+        variant: 'destructive',
+        title: '⚠️ Duplicate Invoice Detected!',
+        description: 'This invoice was already scanned. Do NOT collect money again.',
+        duration: 12000,
+      });
     }
-    if (result.isPartialPayment) {
-      toast({ variant: 'destructive', title: '💰 Possible Partial Payment', description: 'Same invoice # exists with a higher total. Verify with customer.', duration: 10000 });
+    if (result.isPartialPayment && result.partialPaymentOriginalTotal !== undefined) {
+      toast({
+        variant: 'destructive',
+        title: '💰 Partial Payment Alert',
+        description: `Expected ${result.partialPaymentOriginalTotal.toFixed(2)} but this invoice shows ${result.validatedData.total?.toFixed(2) ?? '?'}. Verify with manager.`,
+        duration: 12000,
+      });
     }
-    if (result.isRecurring && result.recurringDelta !== undefined && Math.abs(result.recurringDelta) > 20) {
-      toast({ variant: 'destructive', title: `Recurring — Price ${result.recurringDelta > 0 ? '+' : ''}${result.recurringDelta}%`, description: 'Invoice amount differs significantly from last time.', duration: 8000 });
+
+    // ── Protocol 6: price spike toast ──
+    if (result.priceWarnings && result.priceWarnings.length > 0) {
+      toast({
+        variant: 'destructive',
+        title: '📈 Price Spike Detected',
+        description: result.priceWarnings[0],
+        duration: 10000,
+      });
+    }
+
+    // ── Reconciliation applied notification ──
+    if (result.reconciliationApplied) {
+      toast({
+        title: '🔄 Total Re-verified',
+        description: 'Grand total was unclear — the AI re-read the totals section and confirmed the amount.',
+        duration: 8000,
+      });
     }
 
     setHistory(prev => [result, ...prev]);
@@ -216,7 +258,7 @@ export default function HomePage() {
     setIsCameraOpen(false);
     setShowHistory(false);
 
-    // #51 — haptic feedback on capture
+    // Haptic feedback on capture
     if ('vibrate' in navigator) navigator.vibrate(50);
 
     if (!isOnline) {
@@ -236,7 +278,6 @@ export default function HomePage() {
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      // #10 — file size guard (client side)
       if (file.size > 12 * 1024 * 1024) {
         toast({ variant: 'destructive', title: 'File Too Large', description: 'Please use an image under 12MB.', duration: 8000 });
         if (e.target) e.target.value = '';
@@ -281,11 +322,9 @@ export default function HomePage() {
   };
   const handleClearHistory = () => { setHistory([]); handleReset(); };
 
-  // #7 — import history
   const handleImportAll = async (file: File) => {
     try {
       const imported = await importHistory(file);
-      // Merge: deduplicate by id
       setHistory(prev => {
         const existingIds = new Set(prev.map(i => i.id));
         const newEntries = imported.filter(i => !existingIds.has(i.id));
@@ -297,7 +336,6 @@ export default function HomePage() {
     }
   };
 
-  // #63 — show skeleton briefly when opening history
   const handleHistoryToggle = () => {
     if (!showHistory) {
       setShowHistoryLoading(true);
@@ -331,7 +369,6 @@ export default function HomePage() {
     );
   };
 
-  // ── PIN LOCK ──
   if (pinRequired) {
     return <PinLockScreen pinHash={settings.pinHash} onUnlock={() => setIsUnlocked(true)} />;
   }
@@ -347,14 +384,13 @@ export default function HomePage() {
           onSettingsOpen={() => setShowSettings(true)}
         />
 
-        {/* Main scrollable content */}
         <main className="flex-1 overflow-y-auto pb-28" style={{ WebkitOverflowScrolling: 'touch' }}>
           <div className="container mx-auto px-3 py-4 max-w-2xl lg:max-w-6xl">
             {renderMain()}
           </div>
         </main>
 
-        {/* ── MOBILE HISTORY DRAWER ── */}
+        {/* Mobile history drawer */}
         {showHistory && (
           <div className="fixed inset-0 z-40 flex flex-col" onClick={() => setShowHistory(false)}>
             <div className="flex-1 bg-black/40" />
@@ -370,7 +406,6 @@ export default function HomePage() {
                 </button>
               </div>
               <div className="overflow-y-auto" style={{ maxHeight: 'calc(80dvh - 64px)' }}>
-                {/* #63 — skeleton loaders */}
                 {showHistoryLoading ? (
                   <HistorySkeletons />
                 ) : (
@@ -387,7 +422,7 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* ── STICKY BOTTOM ACTION BAR ── */}
+        {/* Sticky bottom action bar */}
         {view !== 'processing' && (
           <div className="bottom-bar no-print">
             {view === 'results' ? (
@@ -397,7 +432,7 @@ export default function HomePage() {
             ) : null}
             <button className="action-btn-secondary flex-1" onClick={handleHistoryToggle}>
               <History className="h-5 w-5" />
-              History {history.length > 0 && (
+              History {mounted && history.length > 0 && (
                 <span className="ml-1 bg-primary text-primary-foreground text-xs rounded-full px-2 py-0.5">
                   {history.length}
                 </span>
@@ -412,7 +447,7 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* ── PWA INSTALL BANNER ── */}
+        {/* PWA install banner */}
         {showInstallPrompt && (
           <div className="pwa-banner no-print">
             <div className="flex-1">
@@ -432,7 +467,6 @@ export default function HomePage() {
         )}
       </div>
 
-      {/* Hidden file input */}
       <input
         type="file"
         ref={fileInputRef}
@@ -441,7 +475,6 @@ export default function HomePage() {
         className="hidden"
       />
 
-      {/* Fullscreen camera */}
       {isCameraOpen && (
         <CameraView
           onCapture={async (d) => { setIsCameraOpen(false); await handleImageSubmit(d); }}
@@ -449,7 +482,6 @@ export default function HomePage() {
         />
       )}
 
-      {/* Settings panel */}
       {showSettings && (
         <SettingsPanel
           onClose={() => setShowSettings(false)}
