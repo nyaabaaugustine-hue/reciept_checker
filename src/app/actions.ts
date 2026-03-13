@@ -1259,7 +1259,7 @@ export async function processInvoice(
         partialPaymentOriginalTotal = partialResult.originalTotal;
         partialPaymentOriginalId = partialResult.originalId;
         if (isPartialPayment && partialPaymentOriginalTotal !== undefined) {
-          errors.push({ field: 'partial_payment', message: `⚠️ PARTIAL PAYMENT: Original total was ${partialPaymentOriginalTotal.toFixed(2)}, this shows ${validatedData.total?.toFixed(2) ?? '?'}. → Call your manager to confirm before collecting.` });
+          errors.push({ field: 'partial_payment', message: `⚠️ PARTIAL PAYMENT: Original total was ${partialPaymentOriginalTotal.toFixed(2)}, this shows ${validatedData.total?.toFixed(2) ?? '?'}. → Go confirm figures are Correct before Giving invoice Out.` });
         }
 
         const vendorProfiles = buildVendorProfiles(invoiceHistory as InvoiceProcessingResult[]);
