@@ -13,9 +13,8 @@ import { HistorySidebar } from '@/components/app/history-sidebar';
 import { CameraView } from '@/components/app/camera-view';
 import { SettingsPanel } from '@/components/app/settings-panel';
 import { PinLockScreen } from '@/components/app/pin-lock-screen';
-import type { InvoiceProcessingResult, ValidatedData } from '@/lib/types';
+import type { InvoiceProcessingResult, SlimInvoiceResult, ValidatedData } from '@/lib/types';
 import {
-  calcHealthScore,
   getOfflineQueue, removeFromOfflineQueue, addToOfflineQueue,
   preprocessImage, checkImageQuality,
   checkRiskThreshold,
@@ -25,7 +24,21 @@ import { Camera, Upload, History, LayoutDashboard, X } from 'lucide-react';
 
 type ViewState = 'dashboard' | 'processing' | 'results';
 
-// Skeleton loader for history items
+// ── fix #8: speak verdict aloud using Web Speech API ──
+function speakVerdict(verdict: string, reason: string) {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const msg = new SpeechSynthesisUtterance(`${verdict}. ${reason}`);
+  msg.rate = 0.95;
+  msg.volume = 1;
+  window.speechSynthesis.speak(msg);
+}
+
+// ── fix #2: strip ocrText before sending history to server ──
+function slimHistory(history: InvoiceProcessingResult[]): SlimInvoiceResult[] {
+  return history.map(({ ocrText: _ocr, ...rest }) => rest);
+}
+
 const HistorySkeletons = () => (
   <div className="space-y-2 p-3">
     {[1, 2, 3].map(i => (
@@ -61,10 +74,8 @@ export default function HomePage() {
   const wakeLockRef = useRef<any>(null);
   const { toast } = useToast();
 
-  // ── PIN LOCK ──
   const pinRequired = settings.pinEnabled && settings.pinHash && !isUnlocked;
 
-  // ── PWA install prompt ──
   useEffect(() => {
     const handler = (e: any) => { e.preventDefault(); setDeferredPrompt(e); setShowInstallPrompt(true); };
     window.addEventListener('beforeinstallprompt', handler);
@@ -79,7 +90,6 @@ export default function HomePage() {
     setShowInstallPrompt(false);
   };
 
-  // ── Online/offline ──
   useEffect(() => {
     const handleOnline = () => { setIsOnline(true); processOfflineQueue(); };
     const handleOffline = () => setIsOnline(false);
@@ -87,13 +97,9 @@ export default function HomePage() {
     window.addEventListener('offline', handleOffline);
     setIsOnline(navigator.onLine);
     setOfflineQueueCount(getOfflineQueue().length);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
+    return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
   }, []);// eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Background sync: listen for SW message ──
   useEffect(() => {
     const handleMessage = (e: MessageEvent) => {
       if (e.data?.type === 'PROCESS_OFFLINE_QUEUE') processOfflineQueue();
@@ -102,7 +108,6 @@ export default function HomePage() {
     return () => navigator.serviceWorker?.removeEventListener('message', handleMessage);
   }, []);// eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Risk threshold check whenever history changes ──
   useEffect(() => {
     if (!settings.riskThreshold) return;
     const { exceeded, atRisk, threshold } = checkRiskThreshold(history, settings.riskThreshold);
@@ -129,7 +134,6 @@ export default function HomePage() {
     }
   }, []);// eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Screen wake lock while camera is open ──
   useEffect(() => {
     if (isCameraOpen && 'wakeLock' in navigator) {
       navigator.wakeLock.request('screen').then(lock => { wakeLockRef.current = lock; }).catch(() => {});
@@ -139,16 +143,10 @@ export default function HomePage() {
     }
   }, [isCameraOpen]);
 
-  // ─────────────────────────────────────────────────────────────
-  // MAIN SUBMIT FUNCTION
-  // All 9 protocols now run server-side inside processInvoice().
-  // history is passed so the server can run Protocols 6 & 7.
-  // ─────────────────────────────────────────────────────────────
   const submitImage = async (imageUri: string): Promise<InvoiceProcessingResult | null> => {
     setView('processing');
     setProcessingStatus('Checking image quality…');
 
-    // Image quality gate (client-side, fast)
     const quality = await checkImageQuality(imageUri);
     if (!quality.ok) {
       setView('dashboard');
@@ -162,8 +160,8 @@ export default function HomePage() {
     setProcessingStatus('Reading invoice with AI — this may take a moment…');
     let result: InvoiceProcessingResult;
     try {
-      // Pass history so server runs Protocol 6 (price memory) & Protocol 7 (duplicate/partial)
-      result = await processInvoice(optimised, settings.taxRatePct, history);
+      // fix #2: pass slim history (no ocrText) to keep server action payload small
+      result = await processInvoice(optimised, settings.taxRatePct, slimHistory(history));
     } catch (error: any) {
       const raw: string = error?.message ?? '';
       const friendly = raw.replace('Invoice processing failed: ', '').replace('Error: ', '')
@@ -174,78 +172,40 @@ export default function HomePage() {
     }
 
     setProcessingStatus('Finalising analysis…');
+    // fix #4: do NOT overwrite server-computed healthScore here
 
-    // Recalculate health score with all server-enriched fields now present
-    result.healthScore = calcHealthScore(result);
-
-    // ── Protocol 9: surface the risk verdict as a prominent toast ──
+    // ── Verdict toast + fix #8: voice feedback ──
     const verdict = result.riskVerdict;
     if (verdict) {
+      const isUrgent = verdict.verdict === 'REJECT' || verdict.verdict === 'ESCALATE';
       if (verdict.verdict === 'REJECT') {
-        toast({
-          variant: 'destructive',
-          title: '🔴 REJECT — Do NOT collect money',
-          description: verdict.reason,
-          duration: 15000,
-        });
+        toast({ variant: 'destructive', title: '🔴 REJECT — Do NOT collect money', description: verdict.reason, duration: 15000 });
       } else if (verdict.verdict === 'ESCALATE') {
-        toast({
-          variant: 'destructive',
-          title: '🟠 ESCALATE — Call your manager',
-          description: verdict.reason,
-          duration: 15000,
-        });
+        toast({ variant: 'destructive', title: '🟠 ESCALATE — Call your manager', description: verdict.reason, duration: 15000 });
       } else if (verdict.verdict === 'CAUTION') {
-        toast({
-          title: '🟡 CAUTION — Review before collecting',
-          description: verdict.reason,
-          duration: 10000,
-        });
+        toast({ title: '🟡 CAUTION — Review before collecting', description: verdict.reason, duration: 10000 });
       } else {
-        // ACCEPT
-        toast({
-          title: '🟢 ACCEPT — Safe to collect',
-          description: verdict.reason,
-          duration: 8000,
-        });
+        toast({ title: '🟢 ACCEPT — Safe to collect', description: verdict.reason, duration: 8000 });
       }
+      // Speak verdict — especially useful in noisy environments or bright sunlight
+      speakVerdict(verdict.verdict, verdict.reason);
+      // Extra haptic pulse for urgent verdicts
+      if (isUrgent && 'vibrate' in navigator) navigator.vibrate([100, 50, 100, 50, 200]);
     }
 
-    // ── Protocol 7: additional toasts for duplicate / partial ──
-    if (result.isDuplicate) {
-      toast({
-        variant: 'destructive',
-        title: '⚠️ Duplicate Invoice Detected!',
-        description: 'This invoice was already scanned. Do NOT collect money again.',
-        duration: 12000,
-      });
+    // Secondary toasts (only if not already covered by verdict)
+    if (result.isDuplicate && verdict?.verdict !== 'REJECT') {
+      toast({ variant: 'destructive', title: '⚠️ Duplicate Invoice', description: 'Already scanned. Do NOT collect money again.', duration: 12000 });
     }
-    if (result.isPartialPayment && result.partialPaymentOriginalTotal !== undefined) {
-      toast({
-        variant: 'destructive',
-        title: '💰 Partial Payment Alert',
-        description: `Expected ${result.partialPaymentOriginalTotal.toFixed(2)} but this invoice shows ${result.validatedData.total?.toFixed(2) ?? '?'}. Verify with manager.`,
-        duration: 12000,
-      });
+    if (result.isPartialPayment && result.partialPaymentOriginalTotal !== undefined && verdict?.verdict !== 'CAUTION') {
+      toast({ variant: 'destructive', title: '💰 Partial Payment', description: `Original total was ${result.partialPaymentOriginalTotal.toFixed(2)}. Verify with manager.`, duration: 12000 });
     }
-
-    // ── Protocol 6: price spike toast ──
-    if (result.priceWarnings && result.priceWarnings.length > 0) {
-      toast({
-        variant: 'destructive',
-        title: '📈 Price Spike Detected',
-        description: result.priceWarnings[0],
-        duration: 10000,
-      });
+    if (result.priceWarnings?.length && verdict?.verdict === 'ACCEPT') {
+      // Only show separately when verdict didn't already convey price issue
+      toast({ title: '📈 Price Change', description: result.priceWarnings[0], duration: 10000 });
     }
-
-    // ── Reconciliation applied notification ──
     if (result.reconciliationApplied) {
-      toast({
-        title: '🔄 Total Re-verified',
-        description: 'Grand total was unclear — the AI re-read the totals section and confirmed the amount.',
-        duration: 8000,
-      });
+      toast({ title: '🔄 Total Re-verified', description: 'Grand total was re-read and confirmed.', duration: 6000 });
     }
 
     setHistory(prev => [result, ...prev]);
@@ -257,22 +217,15 @@ export default function HomePage() {
   const handleImageSubmit = async (imageUri: string) => {
     setIsCameraOpen(false);
     setShowHistory(false);
-
-    // Haptic feedback on capture
     if ('vibrate' in navigator) navigator.vibrate(50);
-
     if (!isOnline) {
       addToOfflineQueue(imageUri);
       setOfflineQueueCount(getOfflineQueue().length);
       toast({ title: '📵 Offline — Queued', description: 'Will process when back online.', duration: 8000 });
       return;
     }
-
-    try {
-      await submitImage(imageUri);
-    } finally {
-      setProcessingStatus(null);
-    }
+    try { await submitImage(imageUri); }
+    finally { setProcessingStatus(null); }
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -369,9 +322,7 @@ export default function HomePage() {
     );
   };
 
-  if (pinRequired) {
-    return <PinLockScreen pinHash={settings.pinHash} onUnlock={() => setIsUnlocked(true)} />;
-  }
+  if (pinRequired) return <PinLockScreen pinHash={settings.pinHash} onUnlock={() => setIsUnlocked(true)} />;
 
   return (
     <>
@@ -390,7 +341,6 @@ export default function HomePage() {
           </div>
         </main>
 
-        {/* Mobile history drawer */}
         {showHistory && (
           <div className="fixed inset-0 z-40 flex flex-col" onClick={() => setShowHistory(false)}>
             <div className="flex-1 bg-black/40" />
@@ -406,9 +356,7 @@ export default function HomePage() {
                 </button>
               </div>
               <div className="overflow-y-auto" style={{ maxHeight: 'calc(80dvh - 64px)' }}>
-                {showHistoryLoading ? (
-                  <HistorySkeletons />
-                ) : (
+                {showHistoryLoading ? <HistorySkeletons /> : (
                   <HistorySidebar
                     history={history}
                     onSelect={handleHistorySelect}
@@ -422,7 +370,6 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* Sticky bottom action bar */}
         {view !== 'processing' && (
           <div className="bottom-bar no-print">
             {view === 'results' ? (
@@ -447,7 +394,6 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* PWA install banner */}
         {showInstallPrompt && (
           <div className="pwa-banner no-print">
             <div className="flex-1">
@@ -467,13 +413,7 @@ export default function HomePage() {
         )}
       </div>
 
-      <input
-        type="file"
-        ref={fileInputRef}
-        onChange={handleFileChange}
-        accept="image/png,image/jpeg,image/webp"
-        className="hidden"
-      />
+      <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="image/png,image/jpeg,image/webp" className="hidden" />
 
       {isCameraOpen && (
         <CameraView

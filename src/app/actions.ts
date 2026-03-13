@@ -1,29 +1,18 @@
 'use server';
 
 /**
- * actions.ts — InvoiceGuard AI Processing Engine v3.1
+ * actions.ts — InvoiceGuard AI Processing Engine v3.2
  *
- * FIXED in v3.1:
- *  - Removed deprecated vision models: llama-3.2-90b-vision-preview, llama-3.2-11b-vision-preview
- *  - Removed deprecated text model: mixtral-8x7b-32768
- *  - Added llama-4-maverick as vision fallback
- *  - Fixed image size limit: Groq base64 cap is 4MB (was wrongly set to 11MB)
- *  - Added image downscaling before sending if base64 > 3.5MB
- *
- * Complete 9-Protocol Intelligence System:
- *  Layer 1  — Region-aware OCR (Pass 1)
- *  Layer 2  — Arithmetic pre-check
- *  Layer 3  — Confidence-scored JSON schema (Pass 2)
- *  Layer 4  — Deterministic math engine
- *  Layer 5  — Hallucination guard
- *  Protocol 6  — Vendor price memory
- *  Protocol 7  — Duplicate + partial payment detection
- *  Protocol 8  — Reconciliation re-query
- *  Protocol 9  — Salesman risk verdict
+ * v3.2 fixes:
+ *  - SlimInvoiceResult accepted as history input (ocrText stripped client-side, fix #2)
+ *  - Protocol 8 only fires when items were also found (fix #9: skip unreadable invoices)
+ *  - priceWarningsAt timestamp stored on result (fix #11)
+ *  - VendorProfile.itemFirstPrices tracked for cumulative drift (fix #3)
  */
 
 import type {
   InvoiceProcessingResult,
+  SlimInvoiceResult,
   ValidatedData,
   ValidationError,
   RiskVerdictResult,
@@ -84,31 +73,23 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 3): P
 }
 
 // ─────────────────────────────────────────────────────────────
-// MODEL LISTS — updated March 2026
-// Removed: llama-3.2-90b-vision-preview (deprecated)
-//          llama-3.2-11b-vision-preview  (deprecated)
-//          mixtral-8x7b-32768            (deprecated March 2025)
+// MODEL LISTS
 // ─────────────────────────────────────────────────────────────
 
-// Vision models — both support image input
 const VISION_MODELS = [
   'meta-llama/llama-4-scout-17b-16e-instruct',
   'meta-llama/llama-4-maverick-17b-128e-instruct',
 ];
 
-// Text-only models — for math pre-check and Pass 2 JSON extraction
 const TEXT_MODELS = [
   'llama-3.3-70b-versatile',
   'llama-3.1-8b-instant',
 ];
 
-// Groq hard limit for base64 images: 4MB
-const GROQ_BASE64_LIMIT = 3_800_000; // 3.8MB — leave headroom for JSON overhead
+const GROQ_BASE64_LIMIT = 3_800_000;
 
 // ─────────────────────────────────────────────────────────────
 // IMAGE SIZE GUARD
-// If the base64 payload is too large, strip it down by reducing
-// JPEG quality. This runs server-side using Buffer (Node.js).
 // ─────────────────────────────────────────────────────────────
 
 async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
@@ -116,23 +97,17 @@ async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
   if (base64Part.length <= GROQ_BASE64_LIMIT) return imageBase64;
 
   console.warn(`[Invoice] Image too large (${base64Part.length} chars). Attempting server-side resize...`);
-
-  // We can't use canvas server-side, but we can truncate quality by re-encoding
-  // with sharp if available, or just error with a clear message.
-  // Since this is Next.js on Node, use the 'sharp' package if available.
   try {
     const sharp = (await import('sharp')).default;
     const buffer = Buffer.from(base64Part, 'base64');
-    // Resize to max 1200px wide, JPEG quality 75 — usually brings it well under 4MB
     const resized = await sharp(buffer)
       .resize({ width: 1200, withoutEnlargement: true })
       .jpeg({ quality: 75 })
       .toBuffer();
     const resizedB64 = resized.toString('base64');
-    console.log(`[Invoice] Resized image: ${base64Part.length} → ${resizedB64.length} chars`);
+    console.log(`[Invoice] Resized: ${base64Part.length} → ${resizedB64.length} chars`);
     return `data:image/jpeg;base64,${resizedB64}`;
   } catch {
-    // sharp not available — throw a clear user-facing error
     throw new Error(
       `Image is too large for processing (${Math.round(base64Part.length / 1024)}KB base64). ` +
       `Groq's limit is ~4MB. Please take a photo at lower resolution or compress the image before uploading.`
@@ -155,16 +130,11 @@ async function callGroqVision(imageUrl: string, prompt: string, apiKey: string):
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
           body: JSON.stringify({
-            model,
-            max_tokens: 3500,
-            temperature: 0.05,
-            messages: [{
-              role: 'user',
-              content: [
-                { type: 'image_url', image_url: { url: imageUrl } },
-                { type: 'text', text: prompt },
-              ],
-            }],
+            model, max_tokens: 3500, temperature: 0.05,
+            messages: [{ role: 'user', content: [
+              { type: 'image_url', image_url: { url: imageUrl } },
+              { type: 'text', text: prompt },
+            ]}],
           }),
         },
         3
@@ -172,23 +142,16 @@ async function callGroqVision(imageUrl: string, prompt: string, apiKey: string):
       if (!response.ok) {
         const body = await response.text();
         console.error(`[Groq Vision] ${model} → HTTP ${response.status}: ${body.slice(0, 300)}`);
-        if (response.status === 400 || response.status === 404 || response.status === 413) {
-          lastError = new Error(`Model ${model} error (${response.status}): ${body.slice(0, 200)}`);
-          continue;
-        }
+        if ([400, 404, 413].includes(response.status)) { lastError = new Error(`Model ${model} error (${response.status})`); continue; }
         throw new Error(`Groq ${response.status}: ${body.slice(0, 200)}`);
       }
-      const completion = await response.json();
-      const content: string | undefined = completion.choices?.[0]?.message?.content;
+      const content: string | undefined = (await response.json()).choices?.[0]?.message?.content;
       if (!content) throw new Error('Empty response from Groq vision.');
       console.log(`[Groq Vision] Success: ${model}`);
       return content;
     } catch (err: any) {
       const msg: string = err.message ?? '';
-      if (msg.includes('error (400)') || msg.includes('error (404)') || msg.includes('error (413)') || msg.includes('unavailable')) {
-        lastError = err;
-        continue;
-      }
+      if (msg.includes('error (400)') || msg.includes('error (404)') || msg.includes('error (413)') || msg.includes('unavailable')) { lastError = err; continue; }
       throw err;
     }
   }
@@ -206,9 +169,7 @@ async function callGroqText(prompt: string, apiKey: string, maxTokens = 2500): P
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
           body: JSON.stringify({
-            model,
-            max_tokens: maxTokens,
-            temperature: 0.0,
+            model, max_tokens: maxTokens, temperature: 0.0,
             messages: [{ role: 'user', content: prompt }],
           }),
         },
@@ -217,23 +178,16 @@ async function callGroqText(prompt: string, apiKey: string, maxTokens = 2500): P
       if (!response.ok) {
         const body = await response.text();
         console.error(`[Groq Text] ${model} → HTTP ${response.status}: ${body.slice(0, 300)}`);
-        if (response.status === 400 || response.status === 404) {
-          lastError = new Error(`Model ${model} error (${response.status}): ${body.slice(0, 200)}`);
-          continue;
-        }
+        if ([400, 404].includes(response.status)) { lastError = new Error(`Model ${model} error (${response.status})`); continue; }
         throw new Error(`Groq text ${response.status}: ${body.slice(0, 200)}`);
       }
-      const completion = await response.json();
-      const content: string | undefined = completion.choices?.[0]?.message?.content;
+      const content: string | undefined = (await response.json()).choices?.[0]?.message?.content;
       if (!content) throw new Error('Empty response from Groq text.');
       console.log(`[Groq Text] Success: ${model}`);
       return content;
     } catch (err: any) {
       const msg: string = err.message ?? '';
-      if (msg.includes('error (400)') || msg.includes('error (404)') || msg.includes('unavailable')) {
-        lastError = err;
-        continue;
-      }
+      if (msg.includes('error (400)') || msg.includes('error (404)') || msg.includes('unavailable')) { lastError = err; continue; }
       throw err;
     }
   }
@@ -241,7 +195,7 @@ async function callGroqText(prompt: string, apiKey: string, maxTokens = 2500): P
 }
 
 // ─────────────────────────────────────────────────────────────
-// LAYER 1 — REGION-AWARE PASS 1 PROMPT
+// PROMPTS
 // ─────────────────────────────────────────────────────────────
 
 const PASS1_PROMPT = `You are a forensic OCR specialist. Your job is to READ EXACTLY what is printed or handwritten on this invoice/receipt image — digit by digit, character by character. Never estimate, never round, never guess.
@@ -299,10 +253,6 @@ IMAGE QUALITY: [Clear / Slightly blurry / Dark / Very hard to read]
 UNCERTAIN FIELDS: [list any field you are not 100% sure about]
 ANY OTHER TEXT: [stamps, handwritten notes, signatures, payment method, etc.]`;
 
-// ─────────────────────────────────────────────────────────────
-// LAYER 2 — MATH PRE-CHECK
-// ─────────────────────────────────────────────────────────────
-
 function buildMathPreCheckPrompt(transcription: string): string {
   return `You are an arithmetic auditor. Below is a raw OCR transcription of an invoice. Check whether the numbers are internally consistent BEFORE anyone converts this to structured data.
 
@@ -331,10 +281,6 @@ Report ONLY this JSON — no markdown, no explanation:
   "math_notes": ["any observations"]
 }`;
 }
-
-// ─────────────────────────────────────────────────────────────
-// LAYER 3 — CONFIDENCE-SCORED PASS 2 PROMPT
-// ─────────────────────────────────────────────────────────────
 
 function buildPass2Prompt(transcription: string, mathCheck: any): string {
   const mathContext = mathCheck
@@ -408,10 +354,6 @@ Respond ONLY with this JSON — no markdown, no explanation, no trailing text:
 }`;
 }
 
-// ─────────────────────────────────────────────────────────────
-// PROTOCOL 8 — RECONCILIATION RE-QUERY PROMPT
-// ─────────────────────────────────────────────────────────────
-
 const RECONCILIATION_PROMPT = `You are a forensic auditor doing a TARGETED re-read of one specific section of an invoice image.
 
 FOCUS ONLY on the TOTALS / SUMMARY section at the BOTTOM of the document — ignore everything else.
@@ -479,7 +421,6 @@ function runMathEngine(ai: any): MathResult {
     const expectedCovid   = Math.round(subtotal * 0.010 * 100) / 100;
     const levyBase        = safeSum(subtotal, nhil ?? expectedNhil, getfund ?? expectedGetfund, covidLevy ?? expectedCovid);
     const expectedVat     = Math.round(levyBase * 0.15 * 100) / 100;
-
     if (nhil !== undefined && Math.abs(nhil - expectedNhil) > 0.15)
       mathErrors.push(`NHIL: invoice shows ${nhil.toFixed(2)}, expected ~${expectedNhil.toFixed(2)} (2.5% of ${subtotal.toFixed(2)}). Verify.`);
     if (getfund !== undefined && Math.abs(getfund - expectedGetfund) > 0.15)
@@ -505,10 +446,7 @@ function runMathEngine(ai: any): MathResult {
           `but invoice shows ${aiTotal.toFixed(2)} (diff ${Math.abs(aiTotal - computedTotal).toFixed(2)}). ` +
           (ai.is_gra_invoice ? 'Trusting printed total for GRA invoice.' : 'Math override applied.')
         );
-        if (!ai.is_gra_invoice) {
-          correctedTotal = computedTotal;
-          mathOverride = true;
-        }
+        if (!ai.is_gra_invoice) { correctedTotal = computedTotal; mathOverride = true; }
       }
     }
   }
@@ -618,10 +556,7 @@ function buildRiskVerdict(params: {
     moneyAtRisk = total ?? 0;
     details.push(...mathErrors);
   } else if (priceWarnings.length > 0) {
-    const bigSpike = priceWarnings.some(w => {
-      const match = w.match(/(\d+)%/);
-      return match && parseInt(match[1]) > 50;
-    });
+    const bigSpike = priceWarnings.some(w => { const m = w.match(/(\d+)%/); return m && parseInt(m[1]) > 50; });
     verdict = bigSpike ? 'ESCALATE' : 'CAUTION';
     reason = bigSpike
       ? `One or more item prices have more than doubled since the last invoice from this vendor. Do not accept without manager approval.`
@@ -635,10 +570,7 @@ function buildRiskVerdict(params: {
     details.push(...errors.filter(e => e.field === 'total').map(e => e.message));
   } else if (errors.some(e => ['invoice_number', 'customer_name', 'date'].includes(e.field))) {
     verdict = 'CAUTION';
-    const missing = errors
-      .filter(e => ['invoice_number', 'customer_name', 'date'].includes(e.field))
-      .map(e => e.field.replace('_', ' '))
-      .join(', ');
+    const missing = errors.filter(e => ['invoice_number', 'customer_name', 'date'].includes(e.field)).map(e => e.field.replace('_', ' ')).join(', ');
     reason = `Invoice is missing key information (${missing}). Collect only if the vendor can clarify these details.`;
     moneyAtRisk = 0;
     details.push(...errors.map(e => e.message));
@@ -659,9 +591,7 @@ function buildRiskVerdict(params: {
     details.push(...errors.map(e => e.message));
   }
 
-  for (const f of hallucinationFlags) {
-    if (!details.includes(f)) details.push(f);
-  }
+  for (const f of hallucinationFlags) { if (!details.includes(f)) details.push(f); }
 
   return { verdict, reason, details, moneyAtRisk };
 }
@@ -671,91 +601,65 @@ function buildRiskVerdict(params: {
 // ─────────────────────────────────────────────────────────────
 
 function parseGroqJson(raw: string): any {
-  const cleaned = raw
-    .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+  const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
   try { return JSON.parse(cleaned); }
   catch {
     const match = cleaned.match(/\{[\s\S]*\}/);
-    if (match) {
-      try { return JSON.parse(match[0]); }
-      catch { throw new Error(`Could not parse JSON from model response. Raw: ${cleaned.slice(0, 400)}`); }
-    }
-    throw new Error(`No JSON found in model response. Raw: ${cleaned.slice(0, 400)}`);
+    if (match) { try { return JSON.parse(match[0]); } catch { /* fall through */ } }
+    throw new Error(`Could not parse JSON from model response. Raw: ${cleaned.slice(0, 400)}`);
   }
 }
 
 // ─────────────────────────────────────────────────────────────
 // MAIN SERVER ACTION
+// fix #2: accepts SlimInvoiceResult[] (ocrText stripped client-side)
 // ─────────────────────────────────────────────────────────────
 
 export async function processInvoice(
   imageBase64: string,
   taxRatePct: number = 15,
-  invoiceHistory: InvoiceProcessingResult[] = []
+  invoiceHistory: SlimInvoiceResult[] = []
 ): Promise<InvoiceProcessingResult> {
   try {
     const groqApiKey = getGroqApiKey();
-
     const matches = imageBase64.match(/^data:(.+);base64,(.+)$/);
     if (!matches) throw new Error('Invalid image format. Expected a base64 data URI.');
-    const mediaType = matches[1];
 
-    // ── Image size guard: Groq hard-limits base64 to ~4MB ──
-    const sizedImageUrl = await ensureImageUnderLimit(imageBase64);
-    const imageUrl = sizedImageUrl;
-
+    const imageUrl = await ensureImageUnderLimit(imageBase64);
     console.log(`[Invoice] Image size: ${Math.round((imageUrl.split(',')[1]?.length ?? 0) / 1024)}KB base64`);
 
-    // ══════════════════════════════════════════════════════
-    // PASS 1 — Region-aware OCR
-    // ══════════════════════════════════════════════════════
+    // PASS 1
     console.log('[Invoice] Pass 1: region-aware OCR...');
     const transcription = await callGroqVision(imageUrl, PASS1_PROMPT, groqApiKey);
     console.log('[Invoice] Pass 1 done, length:', transcription.length);
 
-    // ══════════════════════════════════════════════════════
-    // LAYER 2 — Arithmetic pre-check
-    // ══════════════════════════════════════════════════════
+    // LAYER 2 — Math pre-check
     console.log('[Invoice] Math pre-check...');
     let mathCheck: any = null;
     try {
-      const mathRaw = await callGroqText(buildMathPreCheckPrompt(transcription), groqApiKey, 1000);
-      mathCheck = parseGroqJson(mathRaw);
+      mathCheck = parseGroqJson(await callGroqText(buildMathPreCheckPrompt(transcription), groqApiKey, 1000));
       console.log('[Invoice] Math pre-check result:', JSON.stringify(mathCheck).slice(0, 200));
-    } catch (e) {
-      console.warn('[Invoice] Math pre-check failed (non-fatal):', e);
-    }
+    } catch (e) { console.warn('[Invoice] Math pre-check failed (non-fatal):', e); }
 
-    // ══════════════════════════════════════════════════════
-    // PASS 2 — Confidence-scored JSON extraction
-    // ══════════════════════════════════════════════════════
+    // PASS 2
     console.log('[Invoice] Pass 2: structured JSON extraction...');
     let rawJson = '';
     try {
       rawJson = await callGroqText(buildPass2Prompt(transcription, mathCheck), groqApiKey, 2500);
     } catch (textErr) {
-      // Fallback: use vision model for Pass 2 if all text models fail
       console.warn('[Invoice] All text models failed for Pass 2, falling back to vision model:', textErr);
       rawJson = await callGroqVision(imageUrl, buildPass2Prompt(transcription, mathCheck), groqApiKey);
     }
 
     let ai = parseGroqJson(rawJson);
-
-    // ══════════════════════════════════════════════════════
-    // LAYER 4 — Math engine
-    // ══════════════════════════════════════════════════════
     let math = runMathEngine(ai);
-
-    // ══════════════════════════════════════════════════════
-    // LAYER 5 — Hallucination guard
-    // ══════════════════════════════════════════════════════
     let hallucinationReport = runHallucinationGuard(ai, math);
 
-    // ══════════════════════════════════════════════════════
     // PROTOCOL 8 — Reconciliation re-query
-    // ══════════════════════════════════════════════════════
+    // fix #9: only fire when items were found (otherwise the totals zone doesn't exist to re-read)
     let reconciliationApplied = false;
-    if (hallucinationReport.totalUncertain) {
+    const hasItems = (ai.items ?? []).length > 0;
+    if (hallucinationReport.totalUncertain && hasItems) {
       console.log('[Invoice] Protocol 8: reconciliation re-query...');
       try {
         const reconText = await callGroqVision(imageUrl, RECONCILIATION_PROMPT, groqApiKey);
@@ -772,14 +676,10 @@ export async function processInvoice(
             console.log(`[Invoice] Reconciliation: total → ${reconTotal} (${reconConf})`);
           }
         }
-      } catch (e) {
-        console.warn('[Invoice] Protocol 8 failed (non-fatal):', e);
-      }
+      } catch (e) { console.warn('[Invoice] Protocol 8 failed (non-fatal):', e); }
     }
 
-    // ══════════════════════════════════════════════════════
     // BUILD VALIDATED DATA
-    // ══════════════════════════════════════════════════════
     const validatedData: ValidatedData = {
       invoice_number: ai.invoice_number || undefined,
       date:           ai.date || undefined,
@@ -796,11 +696,8 @@ export async function processInvoice(
       })),
     };
 
-    // ══════════════════════════════════════════════════════
     // VALIDATION ERRORS
-    // ══════════════════════════════════════════════════════
     const errors: ValidationError[] = [];
-
     if (!validatedData.invoice_number)
       errors.push({ field: 'invoice_number', message: 'Invoice number is missing or unreadable.' });
     if (!validatedData.customer_name)
@@ -809,14 +706,12 @@ export async function processInvoice(
       errors.push({ field: 'total', message: 'Grand total is missing. Check the bottom of the invoice.' });
     if (!validatedData.items || validatedData.items.length === 0)
       errors.push({ field: 'items', message: 'No line items found on this invoice.' });
-
     if (ai.total_confidence === 'low' && !reconciliationApplied)
       errors.push({ field: 'total', message: `Grand total was difficult to read (low confidence). Verify the amount: ${validatedData.total?.toFixed(2) ?? 'unknown'}.` });
     if (ai.subtotal_confidence === 'low')
       errors.push({ field: 'subtotal', message: 'Subtotal was difficult to read. Please verify.' });
     if (ai.customer_name_confidence === 'low')
       errors.push({ field: 'customer_name', message: `Vendor name was partially readable. Verify: "${validatedData.customer_name}".` });
-
     for (const flag of hallucinationReport.flags)
       errors.push({ field: 'hallucination', message: `⚠️ ${flag}` });
     for (const msg of math.mathErrors)
@@ -833,10 +728,7 @@ export async function processInvoice(
         if (qty > 0 && unitPrice > 0) {
           const expected = Math.round(qty * unitPrice * 100) / 100;
           if (Math.abs(expected - lineTotal) > 0.10)
-            errors.push({
-              field: `items[${i}].line_total`,
-              message: `"${item.name || 'Item'}" maths: ${qty} × ${unitPrice.toFixed(2)} = ${expected.toFixed(2)}, invoice shows ${lineTotal.toFixed(2)} (diff ${Math.abs(lineTotal - expected).toFixed(2)}).`,
-            });
+            errors.push({ field: `items[${i}].line_total`, message: `"${item.name || 'Item'}" maths: ${qty} × ${unitPrice.toFixed(2)} = ${expected.toFixed(2)}, invoice shows ${lineTotal.toFixed(2)} (diff ${Math.abs(lineTotal - expected).toFixed(2)}).` });
         }
       }
     }
@@ -844,95 +736,69 @@ export async function processInvoice(
 
     if (validatedData.subtotal !== undefined && itemsSum > 0 && Math.abs(itemsSum - validatedData.subtotal) > 0.10)
       errors.push({ field: 'subtotal', message: `Line items sum to ${itemsSum.toFixed(2)} but subtotal shows ${validatedData.subtotal.toFixed(2)}.` });
-
     if (validatedData.subtotal !== undefined && validatedData.tax !== undefined && validatedData.total !== undefined) {
       const expectedTotal = safeSum(validatedData.subtotal, validatedData.tax);
-      const pct = Math.abs(expectedTotal - validatedData.total) / Math.max(validatedData.total, 1) * 100;
-      if (pct > 1)
+      if (Math.abs(expectedTotal - validatedData.total) / Math.max(validatedData.total, 1) * 100 > 1)
         errors.push({ field: 'total', message: `Total check: ${validatedData.subtotal.toFixed(2)} + tax ${validatedData.tax.toFixed(2)} = ${expectedTotal.toFixed(2)}, invoice shows ${validatedData.total.toFixed(2)}.` });
     }
-
     if (!ai.is_gra_invoice && validatedData.subtotal && validatedData.tax && validatedData.subtotal > 0) {
       const impliedRate = Math.round((validatedData.tax / validatedData.subtotal) * 10000) / 100;
       if (impliedRate > 0 && Math.abs(impliedRate - taxRatePct) > 8)
         errors.push({ field: 'tax', message: `Tax rate appears unusual: ${impliedRate}% (expected ~${taxRatePct}%). Verify before receiving payment.` });
     }
-
     const dateWarning = checkDateAnomaly(validatedData.date);
     if (dateWarning) errors.push({ field: 'date', message: dateWarning });
 
-    // ══════════════════════════════════════════════════════
     // PROTOCOL 6 — Vendor price memory
-    // ══════════════════════════════════════════════════════
     let priceWarnings: string[] = [];
+    const priceWarningsAt = new Date().toISOString(); // fix #11
     if (invoiceHistory.length > 0) {
-      const vendorProfiles = buildVendorProfiles(invoiceHistory);
+      const vendorProfiles = buildVendorProfiles(invoiceHistory as InvoiceProcessingResult[]);
       const vendorKey = normaliseVendorKey(validatedData.customer_name);
-      const tempResult = {
-        id: '__temp__', validatedData, errors: [], isValid: true,
-        ocrText: '', status: 'verified' as const, createdAt: new Date().toISOString(),
-      } as InvoiceProcessingResult;
+      const tempResult = { id: '__temp__', validatedData, errors: [], isValid: true, ocrText: '', status: 'verified' as const, createdAt: new Date().toISOString() } as InvoiceProcessingResult;
       priceWarnings = checkPriceMemory(tempResult, vendorProfiles[vendorKey]);
-      for (const w of priceWarnings)
-        errors.push({ field: 'price_memory', message: w });
+      for (const w of priceWarnings) errors.push({ field: 'price_memory', message: w });
     }
 
-    // ══════════════════════════════════════════════════════
     // PROTOCOL 7 — Duplicate + partial payment detection
-    // ══════════════════════════════════════════════════════
-    let isDuplicate = false;
-    let duplicateOfId: string | undefined;
-    let isPartialPayment = false;
-    let partialPaymentOriginalTotal: number | undefined;
-    let partialPaymentOriginalId: string | undefined;
-    let isRecurring = false;
-    let recurringDelta: number | undefined;
+    let isDuplicate = false, duplicateOfId: string | undefined;
+    let isPartialPayment = false, partialPaymentOriginalTotal: number | undefined, partialPaymentOriginalId: string | undefined;
+    let isRecurring = false, recurringDelta: number | undefined;
 
     if (invoiceHistory.length > 0) {
-      const tempForDetection = {
-        id: '__new__', validatedData, errors, isValid: errors.length === 0,
-        ocrText: '', status: 'verified' as const, createdAt: new Date().toISOString(),
-        vendorKey: normaliseVendorKey(validatedData.customer_name),
-      } as InvoiceProcessingResult;
-
-      const dupResult = detectDuplicate(tempForDetection, invoiceHistory);
+      const tempForDetection = { id: '__new__', validatedData, errors, isValid: errors.length === 0, ocrText: '', status: 'verified' as const, createdAt: new Date().toISOString(), vendorKey: normaliseVendorKey(validatedData.customer_name) } as InvoiceProcessingResult;
+      const dupResult = detectDuplicate(tempForDetection, invoiceHistory as InvoiceProcessingResult[]);
       isDuplicate = dupResult.isDuplicate;
       duplicateOfId = dupResult.duplicateOfId;
 
       if (isDuplicate) {
         errors.push({ field: 'duplicate', message: `🔴 DUPLICATE INVOICE: Already recorded${duplicateOfId ? ` (matches ID ${duplicateOfId})` : ''}. Do NOT collect money again.` });
       } else {
-        const partialResult = detectPartialPayment(tempForDetection, invoiceHistory);
+        const partialResult = detectPartialPayment(tempForDetection, invoiceHistory as InvoiceProcessingResult[]);
         isPartialPayment = partialResult.isPartial;
         partialPaymentOriginalTotal = partialResult.originalTotal;
         partialPaymentOriginalId = partialResult.originalId;
-
         if (isPartialPayment && partialPaymentOriginalTotal !== undefined)
           errors.push({ field: 'partial_payment', message: `⚠️ PARTIAL PAYMENT: Original total was ${partialPaymentOriginalTotal.toFixed(2)}, this shows ${validatedData.total?.toFixed(2) ?? '?'}. Confirm with manager.` });
 
-        const vendorProfiles = buildVendorProfiles(invoiceHistory);
+        const vendorProfiles = buildVendorProfiles(invoiceHistory as InvoiceProcessingResult[]);
         const recurringResult = detectRecurring(tempForDetection, vendorProfiles[normaliseVendorKey(validatedData.customer_name)]);
         isRecurring = recurringResult.isRecurring;
         recurringDelta = recurringResult.recurringDelta;
       }
     }
 
-    // ══════════════════════════════════════════════════════
     // PROTOCOL 9 — Salesman risk verdict
-    // ══════════════════════════════════════════════════════
     const riskVerdict = buildRiskVerdict({
       errors, hallucinationFlags: hallucinationReport.flags, mathErrors: math.mathErrors,
       isDuplicate, duplicateOfId, isPartialPayment, partialOrigTotal: partialPaymentOriginalTotal,
       priceWarnings, total: validatedData.total, reconciliationApplied, mathOverride: math.mathOverride,
     });
 
-    // ══════════════════════════════════════════════════════
     // BUILD FINAL RESULT
-    // ══════════════════════════════════════════════════════
     const isValid = errors.length === 0;
-
     const ocrText =
-      `[InvoiceGuard AI v3.1 | ${ai.currency ?? 'GHS'}${ai.is_gra_invoice ? ' | GRA Tax Invoice' : ''}${ai.supplier_tin ? ` | TIN: ${ai.supplier_tin}` : ''}]\n\n` +
+      `[InvoiceGuard AI v3.2 | ${ai.currency ?? 'GHS'}${ai.is_gra_invoice ? ' | GRA Tax Invoice' : ''}${ai.supplier_tin ? ` | TIN: ${ai.supplier_tin}` : ''}]\n\n` +
       `PASS 1 — REGION-AWARE OCR:\n${transcription}\n\n` +
       (ai.is_gra_invoice ? `GRA Levy Breakdown:\n  (i) ${ai.subtotal} | (ii) NHIL ${ai.nhil} | (iii) GETFund ${ai.getfund} | (iv) COVID ${ai.covid_levy} | (vi) VAT ${ai.vat} | (vii) TOTAL ${ai.total}\n\n` : '') +
       (mathCheck ? `Arithmetic Pre-Check: items_sum=${mathCheck.items_sum} subtotal=${mathCheck.subtotal_from_transcription} tax=${mathCheck.tax_sum_from_transcription} total=${mathCheck.grand_total_from_transcription} match=${mathCheck.subtotal_plus_tax_matches_total}\n\n` : '') +
@@ -945,35 +811,26 @@ export async function processInvoice(
       `PASS 2 — EXTRACTED JSON:\n${JSON.stringify(ai, null, 2)}`;
 
     const result: InvoiceProcessingResult = {
-      id:                          crypto.randomUUID(),
-      isValid,
-      errors,
-      validatedData,
-      ocrText,
-      status:                      isValid ? 'verified' : 'error',
-      createdAt:                   new Date().toISOString(),
-      dueDate:                     ai.due_date || undefined,
-      vendorKey:                   normaliseVendorKey(validatedData.customer_name),
-      smartName:                   buildSmartName(validatedData),
-      currency:                    ai.currency || 'GHS',
-      isDuplicate,
-      duplicateOfId,
-      isPartialPayment,
-      partialPaymentOriginalTotal,
-      partialPaymentOriginalId,
-      isRecurring,
-      recurringDelta,
+      id: crypto.randomUUID(), isValid, errors, validatedData, ocrText,
+      status:                  isValid ? 'verified' : 'error',
+      createdAt:               new Date().toISOString(),
+      dueDate:                 ai.due_date || undefined,
+      vendorKey:               normaliseVendorKey(validatedData.customer_name),
+      smartName:               buildSmartName(validatedData),
+      currency:                ai.currency || 'GHS',
+      isDuplicate, duplicateOfId,
+      isPartialPayment, partialPaymentOriginalTotal, partialPaymentOriginalId,
+      isRecurring, recurringDelta,
       priceWarnings,
+      priceWarningsAt,         // fix #11
       reconciliationApplied,
       riskVerdict,
     };
-
     result.healthScore = calcHealthScore(result);
     return result;
 
   } catch (error: any) {
-    const msg = typeof error?.message === 'string' && error.message.length < 800
-      ? error.message : 'Unknown server error';
+    const msg = typeof error?.message === 'string' && error.message.length < 800 ? error.message : 'Unknown server error';
     console.error('--- processInvoice error ---', error);
     throw new Error(`Invoice processing failed: ${msg}`);
   }

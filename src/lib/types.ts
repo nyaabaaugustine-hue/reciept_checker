@@ -21,16 +21,12 @@ export interface ValidatedData {
 
 export type InvoiceStatus = 'verified' | 'error' | 'corrected' | 'approved' | 'rejected';
 
-// Protocol 9 — salesman risk verdict
 export type RiskVerdict = 'ACCEPT' | 'CAUTION' | 'REJECT' | 'ESCALATE';
 
 export interface RiskVerdictResult {
   verdict: RiskVerdict;
-  // One plain-English sentence the salesman can act on immediately
   reason: string;
-  // Secondary detail lines (shown collapsed, for supervisor review)
   details: string[];
-  // Estimated money at risk from this single invoice (0 if ACCEPT)
   moneyAtRisk: number;
 }
 
@@ -54,19 +50,21 @@ export type InvoiceProcessingResult = {
   isRecurring?: boolean;
   recurringDelta?: number;
   healthScore?: number;
-  // #30 partial payment detection
   isPartialPayment?: boolean;
   partialPaymentOriginalTotal?: number;
   partialPaymentOriginalId?: string;
-  // currency extracted by AI
   currency?: string;
-  // Protocol 6 — price spike warnings from vendor memory
   priceWarnings?: string[];
-  // Protocol 8 — reconciliation re-read applied
   reconciliationApplied?: boolean;
-  // Protocol 9 — salesman risk verdict
   riskVerdict?: RiskVerdictResult;
+  // #fix11 — timestamp for price warning staleness display
+  priceWarningsAt?: string;
+  // #fix3 — first-seen price per item for cumulative drift tracking (stored on vendor profile via buildVendorProfiles)
 };
+
+/** Slim version of InvoiceProcessingResult passed to the server action.
+ *  ocrText is stripped to keep the payload small (fix #2). */
+export type SlimInvoiceResult = Omit<InvoiceProcessingResult, 'ocrText'>;
 
 export interface VendorProfile {
   vendorKey: string;
@@ -77,20 +75,22 @@ export interface VendorProfile {
   lastSeen: string;
   categories: string[];
   itemNames: string[];
+  /** last-seen price per item (lower-cased name) */
   itemPrices: Record<string, number>;
+  /** first-seen price per item — used for cumulative drift (fix #3) */
+  itemFirstPrices: Record<string, number>;
   errorCount: number;
   taxRates: number[];
 }
 
-// #44 / #45 / #46 / #47 / #50 — user settings
 export interface AppSettings {
   salesmanName: string;
-  currency: string;           // e.g. 'GHS', 'USD', 'NGN'
-  taxRatePct: number;         // e.g. 15
-  riskThreshold: string;      // money-at-risk alert threshold
-  customCategories: string[]; // extra categories beyond AI defaults
+  currency: string;
+  taxRatePct: number;
+  riskThreshold: string;
+  customCategories: string[];
   pinEnabled: boolean;
-  pinHash: string;            // SHA-256 of PIN (hex string)
+  pinHash: string;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {

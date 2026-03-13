@@ -1,6 +1,6 @@
 /**
  * invoice-intelligence.ts — InvoiceGuard AI
- * Built for field salesmen. All language reflects collecting/receiving money, not paying.
+ * Built for field salesmen. Language reflects collecting/receiving money, not paying.
  */
 
 import type { InvoiceProcessingResult, VendorProfile, ValidatedData } from './types';
@@ -32,7 +32,6 @@ export function detectDuplicate(
   return { isDuplicate: false };
 }
 
-// #30 — detect partial payment: same invoice number, lower total
 export function detectPartialPayment(
   result: InvoiceProcessingResult,
   history: InvoiceProcessingResult[]
@@ -49,9 +48,7 @@ export function detectPartialPayment(
       hVendorKey === vendorKey &&
       h.validatedData.total !== undefined &&
       total < h.validatedData.total
-    ) {
-      return { isPartial: true, originalTotal: h.validatedData.total, originalId: h.id };
-    }
+    ) return { isPartial: true, originalTotal: h.validatedData.total, originalId: h.id };
   }
   return { isPartial: false };
 }
@@ -66,8 +63,7 @@ export function validateTaxRate(
   const impliedRate = Math.round((tax / subtotal) * 10000) / 100;
   if (Math.abs(impliedRate - expectedRatePct) > 2) {
     return {
-      ok: false,
-      impliedRate,
+      ok: false, impliedRate,
       message: `Tax rate looks unusual: ${impliedRate}% (expected ~${expectedRatePct}%). Verify the tax amount before receiving money.`,
     };
   }
@@ -93,12 +89,20 @@ export function buildSmartName(data: ValidatedData): string {
 
 export function buildVendorProfiles(history: InvoiceProcessingResult[]): Record<string, VendorProfile> {
   const profiles: Record<string, VendorProfile> = {};
-  for (const inv of history) {
+  // Sort oldest-first so first-seen prices are set by earliest invoice
+  const sorted = [...history].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  for (const inv of sorted) {
     const key = normaliseVendorKey(inv.validatedData.customer_name);
     const name = inv.validatedData.customer_name || 'Unknown';
     const total = inv.validatedData.total || 0;
     if (!profiles[key]) {
-      profiles[key] = { vendorKey: key, vendorName: name, invoiceCount: 0, averageTotal: 0, lastTotal: 0, lastSeen: inv.createdAt, categories: [], itemNames: [], itemPrices: {}, errorCount: 0, taxRates: [] };
+      profiles[key] = {
+        vendorKey: key, vendorName: name, invoiceCount: 0,
+        averageTotal: 0, lastTotal: 0, lastSeen: inv.createdAt,
+        categories: [], itemNames: [], itemPrices: {},
+        itemFirstPrices: {}, // fix #3
+        errorCount: 0, taxRates: [],
+      };
     }
     const p = profiles[key];
     p.invoiceCount++;
@@ -110,7 +114,9 @@ export function buildVendorProfiles(history: InvoiceProcessingResult[]): Record<
     if (inv.status === 'error') p.errorCount++;
     for (const item of inv.validatedData.items || []) {
       if (item.name && item.unit_price !== undefined) {
-        p.itemPrices[item.name.toLowerCase()] = item.unit_price;
+        const k = item.name.toLowerCase();
+        p.itemPrices[k] = item.unit_price; // always update to latest
+        if (p.itemFirstPrices[k] === undefined) p.itemFirstPrices[k] = item.unit_price; // fix #3: set once
         if (!p.itemNames.includes(item.name)) p.itemNames.push(item.name);
       }
     }
@@ -121,22 +127,51 @@ export function buildVendorProfiles(history: InvoiceProcessingResult[]): Record<
   return profiles;
 }
 
-export function detectRecurring(result: InvoiceProcessingResult, profile: VendorProfile | undefined): { isRecurring: boolean; recurringDelta?: number } {
+export function detectRecurring(
+  result: InvoiceProcessingResult,
+  profile: VendorProfile | undefined
+): { isRecurring: boolean; recurringDelta?: number } {
   if (!profile || profile.invoiceCount < 2) return { isRecurring: false };
-  const delta = profile.lastTotal > 0 ? Math.round(((result.validatedData.total || 0) - profile.lastTotal) / profile.lastTotal * 100) : 0;
+  const delta = profile.lastTotal > 0
+    ? Math.round(((result.validatedData.total || 0) - profile.lastTotal) / profile.lastTotal * 100)
+    : 0;
   return { isRecurring: true, recurringDelta: delta };
 }
 
-export function checkPriceMemory(result: InvoiceProcessingResult, profile: VendorProfile | undefined): string[] {
+/** fix #3: compares against BOTH last price (incremental spike) AND first-seen price (cumulative drift).
+ *  Flags if either exceeds 15%. */
+export function checkPriceMemory(
+  result: InvoiceProcessingResult,
+  profile: VendorProfile | undefined
+): string[] {
   if (!profile) return [];
   const warnings: string[] = [];
   for (const item of result.validatedData.items || []) {
     if (!item.name || item.unit_price === undefined) continue;
-    const lastPrice = profile.itemPrices[item.name.toLowerCase()];
-    if (lastPrice === undefined) continue;
-    const changePct = ((item.unit_price - lastPrice) / lastPrice) * 100;
-    if (changePct > 20) {
-      warnings.push(`"${item.name}" price rose ${changePct.toFixed(0)}% vs last invoice from this customer (was ${lastPrice.toFixed(2)}, now ${item.unit_price.toFixed(2)}). Verify before receiving money.`);
+    const k = item.name.toLowerCase();
+    const lastPrice = profile.itemPrices[k];
+    const firstPrice = profile.itemFirstPrices[k];
+
+    if (lastPrice !== undefined) {
+      const pct = ((item.unit_price - lastPrice) / lastPrice) * 100;
+      if (pct > 15) {
+        warnings.push(
+          `"${item.name}" is ${pct.toFixed(0)}% higher than last invoice from this vendor ` +
+          `(was ${lastPrice.toFixed(2)}, now ${item.unit_price.toFixed(2)}). Verify before receiving money.`
+        );
+        continue; // already warned — skip cumulative check to avoid double message
+      }
+    }
+
+    // Cumulative drift: compare against very first price seen
+    if (firstPrice !== undefined && firstPrice !== lastPrice) {
+      const driftPct = ((item.unit_price - firstPrice) / firstPrice) * 100;
+      if (driftPct > 30) {
+        warnings.push(
+          `"${item.name}" has drifted ${driftPct.toFixed(0)}% above its original price ` +
+          `(first seen: ${firstPrice.toFixed(2)}, now ${item.unit_price.toFixed(2)}). Worth checking.`
+        );
+      }
     }
   }
   return warnings;
@@ -157,7 +192,6 @@ export function calcHealthScore(result: InvoiceProcessingResult): number {
   return Math.max(0, score);
 }
 
-// #27 — health score breakdown for display
 export function healthScoreBreakdown(result: InvoiceProcessingResult): Array<{ label: string; deduction: number; ok: boolean }> {
   const d = result.validatedData;
   return [
@@ -178,6 +212,19 @@ export function healthLabel(score: number): { label: string; colour: string } {
   if (score >= 65) return { label: 'Good', colour: 'text-blue-600' };
   if (score >= 40) return { label: 'Fair', colour: 'text-yellow-600' };
   return { label: 'Poor', colour: 'text-red-600' };
+}
+
+/** fix #7: money-at-risk counts invoices where verdict is REJECT/ESCALATE,
+ *  not just status==='error', so protocol-9-only risks are included. */
+export function calcMoneyAtRisk(history: InvoiceProcessingResult[]): number {
+  return history
+    .filter(i => {
+      const v = i.riskVerdict?.verdict;
+      // Legacy invoices (pre-v3) fall back to status-based check
+      if (!v) return i.status === 'error';
+      return v === 'REJECT' || v === 'ESCALATE';
+    })
+    .reduce((s, i) => s + (i.validatedData.total || 0), 0);
 }
 
 export function buildTrendData(history: InvoiceProcessingResult[], mode: 'weekly' | 'monthly' = 'monthly') {
@@ -304,23 +351,22 @@ export function buildDailyReportData(history: InvoiceProcessingResult[]) {
     totalValue,
     errorCount: errorInvoices.length,
     approvedCount: approvedInvoices.length,
-    moneyAtRisk: errorInvoices.reduce((s, i) => s + (i.validatedData.total || 0), 0),
+    moneyAtRisk: calcMoneyAtRisk(todayInvoices), // fix #7
     moneySafe: approvedInvoices.reduce((s, i) => s + (i.validatedData.total || 0), 0),
     invoices: todayInvoices,
   };
 }
 
-// #36 — check if money-at-risk exceeds user threshold
-export function checkRiskThreshold(history: InvoiceProcessingResult[], thresholdStr: string): { exceeded: boolean; atRisk: number; threshold: number } {
+export function checkRiskThreshold(
+  history: InvoiceProcessingResult[],
+  thresholdStr: string
+): { exceeded: boolean; atRisk: number; threshold: number } {
   const threshold = parseFloat(thresholdStr) || 0;
   if (threshold <= 0) return { exceeded: false, atRisk: 0, threshold };
-  const atRisk = history
-    .filter(i => i.status === 'error')
-    .reduce((s, i) => s + (i.validatedData.total || 0), 0);
+  const atRisk = calcMoneyAtRisk(history); // fix #7
   return { exceeded: atRisk > threshold, atRisk, threshold };
 }
 
-// #1 Image preprocessing: resize + adjust contrast before sending to AI
 export async function preprocessImage(dataUri: string, maxWidth = 1600): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
@@ -330,46 +376,40 @@ export async function preprocessImage(dataUri: string, maxWidth = 1600): Promise
       canvas.width = Math.round(img.width * scale);
       canvas.height = Math.round(img.height * scale);
       const ctx = canvas.getContext('2d')!;
-      // Slight contrast boost helps OCR
       ctx.filter = 'contrast(1.1) brightness(1.05)';
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       resolve(canvas.toDataURL('image/jpeg', 0.88));
     };
-    img.onerror = () => resolve(dataUri); // fallback: use original
+    img.onerror = () => resolve(dataUri);
     img.src = dataUri;
   });
 }
 
-// #3 — image quality gate: check if image is too dark or too blurry
 export function checkImageQuality(dataUri: string): Promise<{ ok: boolean; reason?: string }> {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      // Sample a small region for speed
-      canvas.width = 64;
-      canvas.height = 64;
+      canvas.width = 64; canvas.height = 64;
       const ctx = canvas.getContext('2d')!;
       ctx.drawImage(img, 0, 0, 64, 64);
       const data = ctx.getImageData(0, 0, 64, 64).data;
       let total = 0;
-      let variance = 0;
       const samples = data.length / 4;
-      for (let i = 0; i < data.length; i += 4) {
-        const brightness = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
-        total += brightness;
-      }
+      for (let i = 0; i < data.length; i += 4)
+        total += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
       const avg = total / samples;
+      let variance = 0;
       for (let i = 0; i < data.length; i += 4) {
-        const brightness = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
-        variance += (brightness - avg) ** 2;
+        const b = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+        variance += (b - avg) ** 2;
       }
       variance /= samples;
       if (avg < 30) return resolve({ ok: false, reason: 'Image is too dark. Move to better lighting and retake.' });
       if (variance < 80) return resolve({ ok: false, reason: 'Image appears blurry or blank. Hold the camera steady and retake.' });
       resolve({ ok: true });
     };
-    img.onerror = () => resolve({ ok: true }); // don't block on error
+    img.onerror = () => resolve({ ok: true });
     img.src = dataUri;
   });
 }
