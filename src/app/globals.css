@@ -59,24 +59,20 @@
   
   body {
     @apply bg-background text-foreground;
-    /* Prevent iOS bounce / overscroll */
     overscroll-behavior: none;
     -webkit-tap-highlight-color: transparent;
     -webkit-touch-callout: none;
   }
 
-  /* ── MOBILE-FIRST: All interactive targets minimum 48px ── */
   button, [role="button"], input, select, textarea, a {
     min-height: 44px;
     touch-action: manipulation;
   }
 
-  /* Bigger base font for field readability */
   html { font-size: 16px; }
 
-  /* Inputs feel native on mobile */
   input, textarea, select {
-    font-size: 16px !important; /* prevent iOS zoom on focus */
+    font-size: 16px !important;
     border-radius: var(--radius);
   }
 }
@@ -84,7 +80,6 @@
 /* ── MOBILE LAYOUT UTILITIES ─────────────────────────────── */
 @layer utilities {
 
-  /* Full-height safe area (notches, home bars) */
   .h-screen-safe {
     height: 100dvh;
     height: calc(100vh - env(safe-area-inset-bottom));
@@ -93,7 +88,6 @@
   .pb-safe { padding-bottom: env(safe-area-inset-bottom, 16px); }
   .pt-safe { padding-top: env(safe-area-inset-top, 0px); }
 
-  /* Large tap targets — use everywhere buttons appear in lists */
   .tap-target {
     min-height: 52px;
     min-width: 52px;
@@ -103,33 +97,13 @@
     cursor: pointer;
   }
 
-  /* Card padding scaled for mobile */
-  .card-mobile {
-    @apply p-3 sm:p-5;
-  }
+  .card-mobile { @apply p-3 sm:p-5; }
+  .mobile-stack { @apply flex flex-col gap-3 sm:flex-row sm:items-center; }
+  .btn-full-mobile { @apply w-full sm:w-auto; }
+  .table-scroll { @apply overflow-x-auto -mx-3 px-3; }
 
-  /* Stack on mobile, side-by-side on desktop */
-  .mobile-stack {
-    @apply flex flex-col gap-3 sm:flex-row sm:items-center;
-  }
-
-  /* Full-width buttons on mobile */
-  .btn-full-mobile {
-    @apply w-full sm:w-auto;
-  }
-
-  /* Scrollable horizontal table on mobile */
-  .table-scroll {
-    @apply overflow-x-auto -mx-3 px-3;
-  }
-
-  /* Fade-in animations */
-  .animate-fade-in-up {
-    animation: fadeInUp 0.3s ease-out both;
-  }
-  .animate-fade-in-left {
-    animation: fadeInLeft 0.25s ease-out both;
-  }
+  .animate-fade-in-up { animation: fadeInUp 0.3s ease-out both; }
+  .animate-fade-in-left { animation: fadeInLeft 0.25s ease-out both; }
 
   @keyframes fadeInUp {
     from { opacity: 0; transform: translateY(16px); }
@@ -140,7 +114,6 @@
     to   { opacity: 1; transform: translateX(0); }
   }
 
-  /* ── Print ── */
   @media print {
     .no-print { display: none !important; }
     main { padding: 0 !important; }
@@ -150,58 +123,77 @@
   }
 }
 
-/* ── MOBILE NAV BAR (bottom action bar for field use) ───── */
+/* ── MOBILE NAV BAR ───────────────────────────────────────── */
 @layer components {
 
-  /* Big action buttons — salesman must be able to tap with one thumb */
+  /* ── Action buttons: fluid font, no overflow on small screens ── */
   .action-btn-primary {
-    @apply flex items-center justify-center gap-2 rounded-xl font-semibold text-base;
+    @apply flex items-center justify-center gap-1.5 rounded-xl font-semibold;
     @apply bg-primary text-primary-foreground;
-    @apply min-h-[56px] px-5 w-full;
+    @apply min-h-[52px] w-full overflow-hidden;
     @apply active:scale-95 transition-transform;
+    padding-left: 8px;
+    padding-right: 8px;
+    font-size: clamp(11px, 3.2vw, 14px);
     touch-action: manipulation;
+    white-space: nowrap;
   }
 
   .action-btn-secondary {
-    @apply flex items-center justify-center gap-2 rounded-xl font-semibold text-base;
+    @apply flex items-center justify-center gap-1.5 rounded-xl font-semibold;
     @apply border-2 border-primary text-primary bg-transparent;
-    @apply min-h-[56px] px-5 w-full;
+    @apply min-h-[52px] w-full overflow-hidden;
     @apply active:scale-95 transition-transform;
+    padding-left: 8px;
+    padding-right: 8px;
+    font-size: clamp(11px, 3.2vw, 14px);
     touch-action: manipulation;
+    white-space: nowrap;
   }
 
   .action-btn-danger {
-    @apply flex items-center justify-center gap-2 rounded-xl font-semibold text-base;
+    @apply flex items-center justify-center gap-1.5 rounded-xl font-semibold;
     @apply bg-destructive text-destructive-foreground;
-    @apply min-h-[56px] px-5 w-full;
+    @apply min-h-[52px] w-full overflow-hidden;
     @apply active:scale-95 transition-transform;
+    padding-left: 8px;
+    padding-right: 8px;
+    font-size: clamp(11px, 3.2vw, 14px);
     touch-action: manipulation;
+    white-space: nowrap;
   }
 
-  /* Status pill badges — large enough to read in sunlight */
   .status-pill {
     @apply inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-semibold;
   }
 
-  /* Mobile card — larger padding, bigger text */
   .invoice-card {
     @apply bg-card rounded-2xl border shadow-sm p-4 space-y-2;
   }
 
-  /* Bottom sticky action bar */
+  /* Bottom bar: buttons fill width evenly, no overflow */
   .bottom-bar {
     @apply fixed bottom-0 left-0 right-0 z-50;
     @apply bg-card/95 backdrop-blur border-t;
-    @apply flex gap-3 p-3;
-    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    display: flex;
+    gap: 8px;
+    padding: 10px 10px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom));
+    width: 100%;
+    box-sizing: border-box;
   }
 
-  /* PWA install prompt */
+  .bottom-bar > * {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
   .pwa-banner {
-    @apply fixed bottom-0 left-0 right-0 z-50;
+    @apply fixed top-0 left-0 right-0 z-50;
     @apply bg-primary text-primary-foreground;
     @apply flex items-center justify-between gap-3 p-4;
-    padding-bottom: calc(16px + env(safe-area-inset-bottom));
+    padding-top: calc(16px + env(safe-area-inset-top));
+    padding-bottom: 16px;
   }
 }
 

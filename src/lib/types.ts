@@ -60,6 +60,8 @@ export type InvoiceProcessingResult = {
   // #fix11 — timestamp for price warning staleness display
   priceWarningsAt?: string;
   // #fix3 — first-seen price per item for cumulative drift tracking (stored on vendor profile via buildVendorProfiles)
+  /** v7.0 — plain-English one-line summary for salesman (built by buildSalesmanSummary) */
+  salesmanSummary?: string;
 };
 
 /** Slim version of InvoiceProcessingResult passed to the server action.
@@ -91,6 +93,16 @@ export interface AppSettings {
   customCategories: string[];
   pinEnabled: boolean;
   pinHash: string;
+}
+
+/** Recurring invoice pattern — used by detectRecurringPatterns in intelligence.ts */
+export interface RecurringPattern {
+  vendorKey: string;
+  vendorName: string;
+  averageTotal: number;
+  frequency: 'weekly' | 'monthly' | 'irregular';
+  lastSeen: string;
+  count: number;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {

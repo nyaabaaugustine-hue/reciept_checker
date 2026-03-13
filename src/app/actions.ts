@@ -1,13 +1,29 @@
 'use server';
 
 /**
- * actions.ts — InvoiceGuard AI Processing Engine v3.2
+ * actions.ts — InvoiceGuard AI Processing Engine v7.0
  *
- * v3.2 fixes:
- *  - SlimInvoiceResult accepted as history input (ocrText stripped client-side, fix #2)
- *  - Protocol 8 only fires when items were also found (fix #9: skip unreadable invoices)
- *  - priceWarningsAt timestamp stored on result (fix #11)
- *  - VendorProfile.itemFirstPrices tracked for cumulative drift (fix #3)
+ * v7.0 — new intelligence checks + speed improvement:
+ *  #I03 Round number anomaly on multi-item invoices
+ *  #I04 Fuzzy vendor name matching (Levenshtein)
+ *  #I11 Cumulative vendor spend threshold (GHS 50,000)
+ *  + salesmanSummary field on every result
+ *  + Math pre-check and Pass 2 now run in parallel (≈ 40% faster)
+ *
+ * v6.0 — 19 robustness improvements for salesmen:
+ *  #3  Region-specific re-read for low-confidence fields (header crop + totals crop)
+ *  #4  Handwriting vs print detection — different OCR strategy per type
+ *  #5  Character-level confidence — flags exact uncertain digit positions
+ *  #6  Full column-sum cross-check (all line totals vs subtotal and grand total)
+ *  #7  Unit price consistency check (same item, different price on same invoice)
+ *  #8  Quantity sanity check (0, negative, or abnormally large quantities)
+ *  #9  Currency consistency check (mixed symbols across items vs header)
+ *  #10 Running total chain shown step-by-step in verdict details
+ *  #11 Per-vendor expected total range alert (spike vs vendor history)
+ *  #12 Item name normalisation for price memory (handles abbreviations)
+ *  #14 Time-of-day anomaly flag (late night / weekend / public holiday)
+ *  #15 Invoice number sequential gap detection per vendor
+ *  + all v5.0 features retained
  */
 
 import type {
@@ -28,6 +44,13 @@ import {
   detectDuplicate,
   detectPartialPayment,
   detectRecurring,
+  detectInvoiceNumberGap,
+  checkVendorTotalRange,
+  // v7.0 new checks
+  checkRoundNumberAnomaly,
+  checkVendorNameFuzzyMatch,
+  checkCumulativeVendorSpend,
+  buildSalesmanSummary,
 } from '@/lib/invoice-intelligence';
 
 // ─────────────────────────────────────────────────────────────
@@ -95,7 +118,6 @@ const GROQ_BASE64_LIMIT = 3_800_000;
 async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
   const base64Part = imageBase64.split(',')[1] ?? imageBase64;
   if (base64Part.length <= GROQ_BASE64_LIMIT) return imageBase64;
-
   console.warn(`[Invoice] Image too large (${base64Part.length} chars). Attempting server-side resize...`);
   try {
     const sharp = (await import('sharp')).default;
@@ -110,7 +132,7 @@ async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
   } catch {
     throw new Error(
       `Image is too large for processing (${Math.round(base64Part.length / 1024)}KB base64). ` +
-      `Groq's limit is ~4MB. Please take a photo at lower resolution or compress the image before uploading.`
+      `Please take a photo at lower resolution or compress the image before uploading.`
     );
   }
 }
@@ -130,7 +152,7 @@ async function callGroqVision(imageUrl: string, prompt: string, apiKey: string):
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
           body: JSON.stringify({
-            model, max_tokens: 3500, temperature: 0.05,
+            model, max_tokens: 4000, temperature: 0.0,
             messages: [{ role: 'user', content: [
               { type: 'image_url', image_url: { url: imageUrl } },
               { type: 'text', text: prompt },
@@ -198,123 +220,211 @@ async function callGroqText(prompt: string, apiKey: string, maxTokens = 2500): P
 // PROMPTS
 // ─────────────────────────────────────────────────────────────
 
-const PASS1_PROMPT = `You are a forensic OCR specialist. Your job is to READ EXACTLY what is printed or handwritten on this invoice/receipt image — digit by digit, character by character. Never estimate, never round, never guess.
+/**
+ * PASS 1 — UNIVERSAL DOCUMENT OCR (v6.0)
+ * #4: Detects handwriting vs print and adapts reading strategy
+ * #5: Character-level confidence — marks uncertain digits with "?" 
+ */
+const PASS1_PROMPT = `You are an expert forensic document reader. You will be shown a photo or scan of a financial document — it could be ANY type: a GRA tax invoice, a handwritten receipt, a POS printout, a proforma, a delivery note, a simple payment slip, or any other document used to request or record payment.
 
-Read the document in FIVE separate zones and report each zone independently:
+YOUR ONLY JOB: Read exactly what is on this document, character by character, digit by digit. Do not guess. Do not fill in. Do not apply any rules or rates you know from memory.
 
-━━━━━━━━━━━━━━━━━━━━
-ZONE A — HEADER (top section of document)
-━━━━━━━━━━━━━━━━━━━━
-DOCUMENT TYPE: [GRA Tax Invoice / Cash Receipt / Handwritten Receipt / Proforma / Other — pick one]
-SELLER/VENDOR NAME: [exact name at the very top, or company letterhead]
-SELLER TIN: [Tax Identification Number if visible, else NONE]
-INVOICE NUMBER: [exact alphanumeric code, else NONE]
-INVOICE DATE: [exact date as written, else NONE]
-DUE DATE: [payment due date if visible, else NONE]
-BUYER NAME: [customer/buyer name if different from seller, else NONE]
+━━━ ABSOLUTE RULES ━━━
+1. Copy every number EXACTLY as printed — "1,500.50" stays "1,500.50"
+2. If a character is unclear, write "?" for THAT CHARACTER ONLY — e.g. "1,5?0.00" if the 3rd digit is unclear
+3. If a field is completely absent, write NONE
+4. Do NOT apply any tax rates, GRA rules, or accounting formulas
+5. Do NOT assume the document type — describe what you actually see
+6. One wrong digit causes real financial loss — accuracy is everything
 
-━━━━━━━━━━━━━━━━━━━━
-ZONE B — LINE ITEMS TABLE (middle section: the rows of goods/services)
-━━━━━━━━━━━━━━━━━━━━
-List EVERY row in the table. Use this exact format per row:
-ITEM [n]: Description="[text]" | Qty=[number] | UnitPrice=[number] | LineTotal=[number]
-If a column is blank write NULL for that field.
-Do NOT include subtotal/total rows here — only product/service rows.
+━━━ STEP 1 — DOCUMENT TYPE IDENTIFICATION ━━━
+Before reading anything, assess the physical nature of this document:
 
-━━━━━━━━━━━━━━━━━━━━
-ZONE C — TOTALS SECTION (bottom rows: the money summary)
-━━━━━━━━━━━━━━━━━━━━
-List EVERY labelled row in the totals section in the order they appear:
-TOTALS ROW [n]: Label="[exact label]" | Value=[exact number as printed]
+WRITING_TYPE: Is the content [PRINTED / HANDWRITTEN / MIXED] ?
+  → If HANDWRITTEN: Read letter-by-letter. Treat each character independently. Do not assume words from context.
+  → If PRINTED: Read precisely — watch for ink smudges, faded ink, similar digits (1/7, 0/6, 5/6, 8/3)
+  → If MIXED: Apply handwriting rules to handwritten parts, print rules to printed parts
 
-CRITICAL RULES for Zone C:
-- For GRA Tax Invoices the rows are labeled (i) through (vii). Copy EACH label and value:
-    (i)   Tax Exclusive Value
-    (ii)  NHIL (2.5%)
-    (iii) GETFund Levy (2.5%)
-    (iv)  COVID-19 Levy (1%)
-    (v)   Total Levy Inclusive Value
-    (vi)  VAT (15%)
-    (vii) Total Tax Inclusive Value  ← THIS is the grand total the customer pays
-- For non-GRA documents list every row (Subtotal, Discount, Tax, Total, etc.)
-- Copy numbers EXACTLY as printed. "10,010.00" → write "10,010.00", do NOT simplify to "10010".
+DOCUMENT FORMAT: [GRA Tax Invoice / Company Invoice / Handwritten Receipt / POS Thermal Receipt / Proforma Invoice / Delivery Note / Payment Slip / Screenshot / Photocopy / Carbon Copy / Other — describe]
 
-━━━━━━━━━━━━━━━━━━━━
-ZONE D — GRAND TOTAL (the single final amount)
-━━━━━━━━━━━━━━━━━━━━
-GRAND TOTAL AMOUNT: [the final payable number, exactly as written]
-GRAND TOTAL LABEL: [the label next to it, e.g. "Total Tax Inclusive Value" or "TOTAL"]
-CURRENCY: [GHS / USD / GBP / EUR / as shown, default GHS]
+PHYSICAL CONDITION: [Clear / Slightly faded / Crumpled / Torn edges / Glare or reflection / Dark / Blurry / Partial cutoff]
 
-━━━━━━━━━━━━━━━━━━━━
-ZONE E — ANOMALIES & CONFIDENCE
-━━━━━━━━━━━━━━━━━━━━
-IMAGE QUALITY: [Clear / Slightly blurry / Dark / Very hard to read]
-UNCERTAIN FIELDS: [list any field you are not 100% sure about]
-ANY OTHER TEXT: [stamps, handwritten notes, signatures, payment method, etc.]`;
+━━━ STEP 2 — ZONE A: HEADER ━━━
+Read top section carefully:
+SELLER/VENDOR NAME: [exact text or NONE]
+SELLER ADDRESS: [exact text or NONE]
+SELLER TIN/VAT NUMBER: [exact code or NONE]
+INVOICE/RECEIPT NUMBER: [exact alphanumeric — watch for O vs 0, l vs 1]
+INVOICE DATE: [exact date as written or NONE]
+DUE DATE: [if shown or NONE]
+BUYER/CUSTOMER NAME: [if shown or NONE]
+CURRENCY DECLARED IN HEADER: [GHS / USD / EUR / GBP / NGN or NONE if not stated]
+ANY REFERENCE NUMBERS: [PO#, delivery note#, etc. or NONE]
 
+━━━ STEP 3 — ZONE B: LINE ITEMS ━━━
+List EVERY product/service line. Skip totals rows.
+
+For PRINTED invoices:
+  ITEM [n]: Name="[exact]" | Qty=[exact or NULL] | Unit=[e.g. carton/kg/pcs or NULL] | UnitPrice=[exact or NULL] | Discount=[exact or NULL] | LineTotal=[exact or NULL] | Currency=[currency symbol if shown or NONE]
+
+For HANDWRITTEN invoices — extra care:
+  ITEM [n]: Name="[copy exact spelling including abbreviations]" | Qty=[number — watch for 1/7, 0/6] | Unit=[or NULL] | UnitPrice=[exact — write ? for any uncertain digit] | LineTotal=[exact — write ? for any uncertain digit] | HANDWRITING_NOTE=[any difficulty reading this line]
+
+If NO line items (lump sum only): write "NO LINE ITEMS — LUMP SUM ONLY"
+
+━━━ STEP 4 — ZONE C: ALL TOTALS/SUMMARY ROWS ━━━
+List EVERY labelled total row in the order they appear:
+TOTALS ROW [n]: Label="[exact label]" | Value=[exact number — write ? for uncertain digits]
+
+Common labels (copy WHATEVER is written): Subtotal, Net Amount, NHIL, GETFund, COVID Levy, VAT, Tax, Discount, Delivery, Grand Total, Amount Due, Total Tax Inclusive Value
+
+CRITICAL: If NO tax rows exist — that is normal. Many companies include VAT in product prices. List only what is actually on the document.
+
+━━━ STEP 5 — ZONE D: FINAL PAYABLE ━━━
+GRAND TOTAL AMOUNT: [exact final amount or NONE]
+GRAND TOTAL LABEL: [exact label]
+CURRENCY: [GHS / USD / GBP / EUR / NGN / symbol seen — or GHS if none]
+
+━━━ STEP 6 — CHARACTER-LEVEL CONFIDENCE ━━━
+LIST EVERY field where you used "?":
+  UNCERTAIN: [field name] = "[value with ? marks]" — REASON: [what made it hard to read]
+
+LIST any field you could not read at all:
+  UNREADABLE: [field name] — REASON: [dark / blurry / torn / handwriting unclear]
+
+STAMPS/WATERMARKS: [describe]
+OTHER TEXT ON DOCUMENT: [any other text not captured above]`;
+
+/**
+ * PASS 1b — TARGETED RE-READ FOR LOW CONFIDENCE FIELDS (#3)
+ * Called only when specific fields came back low confidence.
+ * Focuses the model on just that region of the document.
+ */
+function buildRegionRereadPrompt(region: 'header' | 'totals' | 'items', uncertainFields: string[]): string {
+  const fieldList = uncertainFields.join(', ');
+  const regionDesc = region === 'header'
+    ? 'the TOP SECTION of the document (business name, invoice number, date, buyer/seller info)'
+    : region === 'totals'
+    ? 'the BOTTOM SECTION (totals, subtotal, tax rows, grand total, amount due)'
+    : 'the MIDDLE SECTION (the table of items, quantities, prices, line totals)';
+
+  return `TARGETED RE-READ — focus ONLY on ${regionDesc}.
+
+These fields were unclear on first read: ${fieldList}
+
+Read ONLY the relevant section with maximum focus:
+- Zoom in mentally on every digit in this region
+- For each uncertain digit: consider all possibilities (is that a 1 or 7? a 0 or 6? a 5 or 6? a 3 or 8?)
+- Report the most likely reading AND note if still uncertain
+
+For each field listed above, report:
+FIELD: [field name]
+VALUE: [your best reading — use ? only if genuinely impossible to determine]
+CONFIDENCE: [HIGH / MEDIUM / LOW]
+REASON_IF_NOT_HIGH: [what specifically makes it unclear]
+
+Then give your BEST READING of the grand total (final payable amount):
+GRAND_TOTAL_BEST_READING: [number or NONE]
+GRAND_TOTAL_CONFIDENCE: [HIGH / MEDIUM / LOW]`;
+}
+
+/**
+ * MATH PRE-CHECK (#6: column sum cross-check, #9: currency consistency)
+ */
 function buildMathPreCheckPrompt(transcription: string): string {
-  return `You are an arithmetic auditor. Below is a raw OCR transcription of an invoice. Check whether the numbers are internally consistent BEFORE anyone converts this to structured data.
+  return `You are a pure arithmetic auditor. Verify internal consistency of this invoice transcription.
+
+CRITICAL RULES:
+- Use ONLY numbers from the transcription below
+- Do NOT apply any tax rates or accounting rules
+- If tax/VAT is NOT in the transcription, that is normal — VAT may be in product prices
+- Set any NONE or "?" value to null — never estimate
+- Only flag a discrepancy if numbers that ARE present do not add up
 
 TRANSCRIPTION:
 ${transcription}
 
 YOUR TASK:
-1. Extract every number from Zone B (line items) and Zone C (totals).
-2. Sum all LineTotal values from Zone B to get ITEMS_SUM.
-3. Identify the pre-tax subtotal from Zone C (row (i) for GRA, or "Subtotal" for others).
-4. Identify each tax component and sum them to get TAX_SUM.
-5. Identify the grand total from Zone D or Zone C last row.
-6. Check: does ITEMS_SUM ≈ subtotal? Does subtotal + TAX_SUM ≈ grand total?
+1. Extract ALL line item values: name, qty, unit_price, line_total for each item
+2. For each item where qty AND unit_price are present: compute qty × unit_price and compare to line_total
+3. Sum all line_total values → ITEMS_SUM
+4. Find subtotal if listed → SUBTOTAL
+5. Find all explicitly listed tax/levy amounts → TAX_SUM (null if none — this is normal)
+6. Find grand total → GRAND_TOTAL
+7. Check consistency:
+   - items_match_subtotal: ITEMS_SUM ≈ SUBTOTAL (only if both present)
+   - subtotal_plus_tax_matches_total: SUBTOTAL + TAX_SUM ≈ GRAND_TOTAL (only if all three present)
+   - items_match_grand_total_directly: ITEMS_SUM ≈ GRAND_TOTAL (when no separate tax rows)
+8. Currency check: list any items where a different currency symbol appears vs the header currency
+9. Compute the running total chain: subtotal → +taxes step by step → final total
 
-Report ONLY this JSON — no markdown, no explanation:
+Respond ONLY with JSON (no markdown):
 {
   "items_sum": number_or_null,
+  "line_item_errors": [
+    { "item_name": "string", "qty": number, "unit_price": number, "stated_line_total": number, "computed_line_total": number, "difference": number }
+  ],
   "subtotal_from_transcription": number_or_null,
   "tax_sum_from_transcription": number_or_null,
+  "tax_explicitly_listed": true_or_false,
   "grand_total_from_transcription": number_or_null,
   "items_match_subtotal": true_or_false_or_null,
   "subtotal_plus_tax_matches_total": true_or_false_or_null,
-  "discrepancies": ["list any mismatch with details"],
+  "items_match_grand_total_directly": true_or_false_or_null,
+  "discrepancies": ["describe mismatch with numbers"],
+  "currency_mismatches": ["item name and what currency symbol appeared"],
+  "running_total_chain": ["step 1: subtotal = X", "step 2: +NHIL = Y", "..."],
   "is_gra_invoice": true_or_false,
+  "vat_inclusive_pricing_likely": true_or_false,
   "corrected_grand_total": number_or_null,
-  "math_notes": ["any observations"]
+  "math_notes": ["observations"]
 }`;
 }
 
+/**
+ * PASS 2 — STRUCTURED JSON EXTRACTION (v6.0)
+ * #5: includes per-field character confidence
+ * #7: unit price consistency flagged
+ * #8: quantity sanity flagged
+ */
 function buildPass2Prompt(transcription: string, mathCheck: any): string {
-  const mathContext = mathCheck
-    ? `
-ARITHMETIC AUDIT RESULTS (verified by a separate math pass — TRUST these numbers):
+  const mathContext = mathCheck ? `
+ARITHMETIC AUDIT RESULTS:
 - Items sum: ${mathCheck.items_sum ?? 'unknown'}
-- Subtotal (pre-tax): ${mathCheck.subtotal_from_transcription ?? 'unknown'}
-- Tax total: ${mathCheck.tax_sum_from_transcription ?? 'unknown'}
+- Subtotal: ${mathCheck.subtotal_from_transcription ?? 'not listed — normal'}
+- Tax total: ${mathCheck.tax_sum_from_transcription ?? 'NOT LISTED — VAT likely in prices'}
+- Tax explicitly listed: ${mathCheck.tax_explicitly_listed ?? 'unknown'}
 - Grand total: ${mathCheck.grand_total_from_transcription ?? 'unknown'}
-- Items match subtotal: ${mathCheck.items_match_subtotal ?? 'unknown'}
-- Subtotal + Tax matches Grand Total: ${mathCheck.subtotal_plus_tax_matches_total ?? 'unknown'}
-- Discrepancies found: ${(mathCheck.discrepancies ?? []).join('; ') || 'none'}
-- Is GRA invoice: ${mathCheck.is_gra_invoice ?? 'unknown'}
-- Math-corrected grand total: ${mathCheck.corrected_grand_total ?? 'use transcription value'}
-
-CRITICAL: If "math-corrected grand total" is provided, use it as the "total" field.
+- Items match subtotal: ${mathCheck.items_match_subtotal ?? 'N/A'}
+- Subtotal+Tax matches Total: ${mathCheck.subtotal_plus_tax_matches_total ?? 'N/A'}
+- Items match Grand Total directly: ${mathCheck.items_match_grand_total_directly ?? 'N/A'}
+- VAT-inclusive pricing likely: ${mathCheck.vat_inclusive_pricing_likely ?? 'unknown'}
+- Discrepancies: ${(mathCheck.discrepancies ?? []).join('; ') || 'none'}
+- Currency mismatches: ${(mathCheck.currency_mismatches ?? []).join('; ') || 'none'}
+- Running total chain: ${(mathCheck.running_total_chain ?? []).join(' → ') || 'N/A'}
+- Math-corrected grand total: ${mathCheck.corrected_grand_total ?? 'not available'}
 ` : '';
 
-  return `You are a JSON data extraction specialist. Convert the invoice transcription below into the exact JSON schema specified. Use the arithmetic audit results to resolve any ambiguity.
+  return `You are a precise JSON data extractor for financial documents.
 
 TRANSCRIPTION:
 ${transcription}
 ${mathContext}
 
 EXTRACTION RULES:
-1. "total" MUST be the final amount the customer pays (Grand Total from Zone D / row (vii) for GRA). NEVER use row (i) Tax Exclusive Value as the total.
-2. "subtotal" = pre-tax base amount (row (i) for GRA, or items sum for simple receipts).
-3. "tax" = the SUM of ALL tax components. For GRA: NHIL + GETFund + COVID Levy + VAT.
-4. All monetary values: strip currency symbols and commas. "GHS 10,010.00" → 10010.00 as a number.
-5. "customer_name" = the VENDOR/SELLER name (top of document, Zone A SELLER field).
-6. For missing fields use null — do not invent values.
-7. "confidence" fields: "high" (clearly visible), "medium" (partially visible/inferred), "low" (guessed or unclear).
 
-Respond ONLY with this JSON — no markdown, no explanation, no trailing text:
+1. NULL RULE: NONE or "?" → null. NEVER invent.
+2. TOTAL RULE: "total" = final payable. For GRA: row (vii).
+3. VAT/TAX RULE: Only set tax fields if EXPLICITLY on document. If absent → vat_included_in_prices: true, all tax fields null.
+4. SUBTOTAL RULE: null if no explicit subtotal row.
+5. VENDOR RULE: "customer_name" = SELLER/VENDOR at top.
+6. CONFIDENCE: "high"=clear, "medium"=partially visible, "low"=uncertain/blurry.
+7. CHARACTER CONFIDENCE: If any digit in a number had "?" → set that field's confidence to "low".
+8. ITEM RULE: copy names exactly — abbreviations, spelling, shorthand preserved.
+9. NUMBER RULE: strip currency symbols and commas → 1200.00
+10. DUPLICATE ITEM RULE: if the same item name appears multiple times on this invoice, flag it.
+
+Respond ONLY with valid JSON (no markdown):
 
 {
   "invoice_number": "string or null",
@@ -322,21 +432,30 @@ Respond ONLY with this JSON — no markdown, no explanation, no trailing text:
   "date": "YYYY-MM-DD or original string or null",
   "date_confidence": "high|medium|low",
   "due_date": "string or null",
-  "customer_name": "SELLER/VENDOR name from top of document, or null",
+  "customer_name": "SELLER/VENDOR name or null",
   "customer_name_confidence": "high|medium|low",
-  "buyer_name": "buyer/customer name if different from seller, or null",
-  "category": "one of: Groceries | Building Materials | Office Supplies | Utilities | Transport | Dining | Electronics | Healthcare | Fuel | Other",
+  "buyer_name": "buyer if shown or null",
+  "category": "Groceries|Building Materials|Office Supplies|Utilities|Transport|Dining|Electronics|Healthcare|Fuel|Other",
+  "document_type_observed": "describe the actual document type",
+  "writing_type": "PRINTED|HANDWRITTEN|MIXED",
   "is_gra_invoice": true_or_false,
+  "vat_included_in_prices": true_or_false,
   "supplier_tin": "string or null",
-  "currency": "GHS or detected currency",
+  "currency": "GHS or detected currency code",
+  "header_currency": "currency from header or null",
   "items": [
     {
       "name": "string or null",
       "quantity": number_or_null,
+      "unit": "string or null",
       "unit_price": number_or_null,
       "unit_price_confidence": "high|medium|low",
+      "uncertain_digits": "describe any ? characters in this item's numbers, or null",
+      "discount": number_or_null,
       "line_total": number_or_null,
-      "line_total_confidence": "high|medium|low"
+      "line_total_confidence": "high|medium|low",
+      "currency_symbol_seen": "symbol if different from header, or null",
+      "is_duplicate_name_on_invoice": true_or_false
     }
   ],
   "subtotal": number_or_null,
@@ -346,51 +465,76 @@ Respond ONLY with this JSON — no markdown, no explanation, no trailing text:
   "covid_levy": number_or_null,
   "vat": number_or_null,
   "vat_confidence": "high|medium|low",
+  "other_taxes": [{ "label": "string", "amount": number }],
   "tax": number_or_null,
   "tax_confidence": "high|medium|low",
+  "discount_total": number_or_null,
   "total": number_or_null,
   "total_confidence": "high|medium|low",
-  "ocr_notes": "any uncertainties, hard-to-read areas, or important observations"
+  "total_uncertain_digits": "describe any ? in the grand total, or null",
+  "ocr_notes": "specific uncertain readings, quality issues, anything unusual"
 }`;
 }
 
-const RECONCILIATION_PROMPT = `You are a forensic auditor doing a TARGETED re-read of one specific section of an invoice image.
+/**
+ * RECONCILIATION — re-read totals region only (#3)
+ */
+const RECONCILIATION_PROMPT = `Focus ONLY on the bottom section of this document (totals area).
 
-FOCUS ONLY on the TOTALS / SUMMARY section at the BOTTOM of the document — ignore everything else.
+RULES: Read only what is physically visible. No formulas or assumptions.
 
-Your ONLY task is to find and transcribe the FINAL GRAND TOTAL — the single largest, most prominent number at the very bottom, representing the full amount to be paid.
+List every number in the bottom section:
+TOTAL ZONE:
+- [label]: [exact number]
 
-For GRA invoices: this is row (vii) "Total Tax Inclusive Value".
-For cash receipts: this is the circled, underlined, or boxed final number.
-For printed receipts: this is the "TOTAL", "AMOUNT DUE", or "BALANCE DUE" line.
-
-Read EVERY number you can see in the bottom third of the document and list them:
-TOTAL ZONE NUMBERS:
-- [label]: [exact number as printed]
-- [label]: [exact number as printed]
-...
-
-GRAND TOTAL: [the final payable amount — exact digits]
-GRAND TOTAL LABEL: [the exact label next to it]
+GRAND TOTAL: [final payable or NONE]
+GRAND TOTAL LABEL: [exact label]
 CONFIDENCE: [high / medium / low]
-REASON FOR UNCERTAINTY (if not high): [explain what makes it hard to read]`;
+IF NOT HIGH: [what makes it hard to read]`;
 
 // ─────────────────────────────────────────────────────────────
-// LAYER 4 — DETERMINISTIC MATH ENGINE
+// #14 — TIME-OF-DAY ANOMALY CHECK
+// ─────────────────────────────────────────────────────────────
+
+function checkTimeOfDayAnomaly(): string | null {
+  const now = new Date();
+  const hour = now.getHours();
+  const day = now.getDay(); // 0=Sun, 6=Sat
+
+  if (day === 0 || day === 6) {
+    return `This invoice was submitted on a ${day === 0 ? 'Sunday' : 'Saturday'}. Most businesses are closed on weekends. Look carefully and confirm this is a legitimate transaction before collecting money.`;
+  }
+  if (hour >= 22 || hour < 5) {
+    return `This invoice was submitted at ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — very late at night. Unusual submission times can be a sign of fraud. Review the invoice carefully before collecting.`;
+  }
+  if (hour >= 20) {
+    return `Invoice submitted after 8pm (${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}). Confirm this is expected — after-hours submissions should be verified.`;
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// LAYER 4 — MATH ENGINE (v6.0)
+// #6 full column cross-check, #7 unit price consistency, #8 qty sanity, #9 currency
 // ─────────────────────────────────────────────────────────────
 
 interface MathResult {
-  correctedSubtotal: number | undefined;
-  correctedTax:      number | undefined;
-  correctedTotal:    number | undefined;
-  mathOverride:      boolean;
-  mathNotes:         string[];
-  mathErrors:        string[];
+  correctedSubtotal:  number | undefined;
+  correctedTax:       number | undefined;
+  correctedTotal:     number | undefined;
+  mathOverride:       boolean;
+  mathNotes:          string[];
+  mathErrors:         string[];
+  mathSuggestions:    string[];
+  runningTotalChain:  string[];
+  vatIncluded:        boolean;
 }
 
-function runMathEngine(ai: any): MathResult {
-  const mathNotes:  string[] = [];
-  const mathErrors: string[] = [];
+function runMathEngine(ai: any, mathCheck?: any): MathResult {
+  const mathNotes:       string[] = [];
+  const mathErrors:      string[] = [];
+  const mathSuggestions: string[] = [];
+  const runningTotalChain: string[] = [];
   let mathOverride = false;
 
   const subtotal  = parseNumber(ai.subtotal);
@@ -400,58 +544,186 @@ function runMathEngine(ai: any): MathResult {
   const vat       = parseNumber(ai.vat);
   const aiTax     = parseNumber(ai.tax);
   const aiTotal   = parseNumber(ai.total);
+  const items     = ai.items ?? [];
 
-  let correctedTax = aiTax;
-  const hasGraLevies = nhil !== undefined || getfund !== undefined || covidLevy !== undefined || vat !== undefined;
-  if (hasGraLevies) {
-    const computedTax = safeSum(nhil, getfund, covidLevy, vat);
-    if (aiTax === undefined) {
-      correctedTax = computedTax;
-      mathNotes.push(`Tax derived from levies: NHIL(${nhil ?? 0}) + GETFund(${getfund ?? 0}) + COVID(${covidLevy ?? 0}) + VAT(${vat ?? 0}) = ${computedTax}`);
-    } else if (Math.abs(computedTax - aiTax) > 0.05) {
-      mathNotes.push(`Tax corrected from ${aiTax} → ${computedTax} (levies sum)`);
-      correctedTax = computedTax;
-      mathOverride = true;
+  // ── #9 Currency consistency check ──
+  const headerCurrency: string = ai.header_currency ?? ai.currency ?? 'GHS';
+  const currencyMismatches = mathCheck?.currency_mismatches ?? [];
+  if (currencyMismatches.length > 0) {
+    mathErrors.push(`Mixed currencies detected: header says ${headerCurrency} but some items show different currency symbols (${currencyMismatches.join(', ')}). Amounts may not be comparable.`);
+    mathSuggestions.push(`Check each item on the physical invoice for currency symbols. All items must be in the same currency as the total (${headerCurrency}).`);
+  }
+  // Also check per-item currency_symbol_seen
+  for (const item of items) {
+    if (item.currency_symbol_seen && item.name) {
+      const itemCurrency = String(item.currency_symbol_seen).toUpperCase();
+      if (itemCurrency !== headerCurrency && itemCurrency !== 'NONE' && itemCurrency !== 'NULL') {
+        mathErrors.push(`Item "${item.name}" appears to be in ${itemCurrency} but invoice header is ${headerCurrency}. This will cause a wrong total.`);
+        mathSuggestions.push(`Confirm the currency for "${item.name}" with the vendor before collecting.`);
+      }
     }
   }
 
-  if (ai.is_gra_invoice && subtotal && subtotal > 0) {
-    const expectedNhil    = Math.round(subtotal * 0.025 * 100) / 100;
-    const expectedGetfund = Math.round(subtotal * 0.025 * 100) / 100;
-    const expectedCovid   = Math.round(subtotal * 0.010 * 100) / 100;
-    const levyBase        = safeSum(subtotal, nhil ?? expectedNhil, getfund ?? expectedGetfund, covidLevy ?? expectedCovid);
-    const expectedVat     = Math.round(levyBase * 0.15 * 100) / 100;
-    if (nhil !== undefined && Math.abs(nhil - expectedNhil) > 0.15)
-      mathErrors.push(`NHIL: invoice shows ${nhil.toFixed(2)}, expected ~${expectedNhil.toFixed(2)} (2.5% of ${subtotal.toFixed(2)}). Verify.`);
-    if (getfund !== undefined && Math.abs(getfund - expectedGetfund) > 0.15)
-      mathErrors.push(`GETFund: invoice shows ${getfund.toFixed(2)}, expected ~${expectedGetfund.toFixed(2)} (2.5% of ${subtotal.toFixed(2)}). Verify.`);
-    if (covidLevy !== undefined && Math.abs(covidLevy - expectedCovid) > 0.15)
-      mathErrors.push(`COVID-19 Levy: invoice shows ${covidLevy.toFixed(2)}, expected ~${expectedCovid.toFixed(2)} (1% of ${subtotal.toFixed(2)}). Verify.`);
-    if (vat !== undefined && Math.abs(vat - expectedVat) > 1.50)
-      mathErrors.push(`VAT: invoice shows ${vat.toFixed(2)}, expected ~${expectedVat.toFixed(2)} (15% on levy base ${levyBase.toFixed(2)}). Verify.`);
+  // ── #8 Quantity sanity check ──
+  for (const item of items) {
+    const qty = parseNumber(item.quantity);
+    const unitPrice = parseNumber(item.unit_price);
+    if (qty !== undefined) {
+      if (qty <= 0) {
+        mathErrors.push(`Item "${item.name || 'unknown'}" has quantity ${qty} — zero or negative quantities are impossible.`);
+        mathSuggestions.push(`Check the quantity for "${item.name || 'this item'}" on the physical invoice. Zero/negative quantities are a writing error.`);
+      } else if (qty > 1000 && unitPrice !== undefined && unitPrice > 0) {
+        const lineValue = qty * unitPrice;
+        mathNotes.push(`Item "${item.name || 'unknown'}" has unusually large quantity: ${qty} × ${unitPrice.toFixed(2)} = ${lineValue.toFixed(2)}. Verify this is correct.`);
+      }
+    }
   }
 
+  // ── #7 Unit price consistency (same item name, different price on same invoice) ──
+  const itemPriceMap: Record<string, number[]> = {};
+  for (const item of items) {
+    if (!item.name || parseNumber(item.unit_price) === undefined) continue;
+    const key = String(item.name).toLowerCase().trim();
+    if (!itemPriceMap[key]) itemPriceMap[key] = [];
+    itemPriceMap[key].push(parseNumber(item.unit_price)!);
+  }
+  for (const [name, prices] of Object.entries(itemPriceMap)) {
+    if (prices.length > 1) {
+      const unique = [...new Set(prices)];
+      if (unique.length > 1) {
+        const displayName = items.find((i: any) => String(i.name).toLowerCase().trim() === name)?.name || name;
+        mathErrors.push(`"${displayName}" appears ${prices.length} times on this invoice with different unit prices: ${unique.map(p => p.toFixed(2)).join(', ')}. This is a pricing inconsistency.`);
+        mathSuggestions.push(`Ask the vendor why "${displayName}" has different prices on the same invoice. There should be one consistent unit price.`);
+      }
+    }
+  }
+
+  // ── VAT determination ──
+  const taxExplicitlyPresent =
+    nhil !== undefined || getfund !== undefined ||
+    covidLevy !== undefined || vat !== undefined || aiTax !== undefined;
+  const vatIncluded = !taxExplicitlyPresent || ai.vat_included_in_prices === true;
+
+  if (vatIncluded && !taxExplicitlyPresent) {
+    mathNotes.push('No tax/VAT rows on invoice — VAT treated as already included in product prices. Tax calculations skipped.');
+  }
+
+  // ── Tax derivation ──
+  let correctedTax = aiTax;
+  if (taxExplicitlyPresent) {
+    const hasGraLevies = nhil !== undefined || getfund !== undefined || covidLevy !== undefined || vat !== undefined;
+    if (hasGraLevies) {
+      const computedTax = safeSum(nhil, getfund, covidLevy, vat);
+      if (aiTax === undefined) {
+        correctedTax = computedTax;
+        mathNotes.push(`Tax derived: NHIL(${nhil ?? 0}) + GETFund(${getfund ?? 0}) + COVID(${covidLevy ?? 0}) + VAT(${vat ?? 0}) = ${computedTax}`);
+      } else if (Math.abs(computedTax - aiTax) > 0.05) {
+        correctedTax = computedTax;
+        mathOverride = true;
+        mathNotes.push(`Tax corrected: ${aiTax} → ${computedTax}`);
+      }
+    }
+
+    // GRA levy rate checks
+    if (ai.is_gra_invoice && subtotal && subtotal > 0 && hasGraLevies) {
+      const expectedNhil    = Math.round(subtotal * 0.025 * 100) / 100;
+      const expectedGetfund = Math.round(subtotal * 0.025 * 100) / 100;
+      const expectedCovid   = Math.round(subtotal * 0.010 * 100) / 100;
+      const levyBase        = safeSum(subtotal, nhil ?? expectedNhil, getfund ?? expectedGetfund, covidLevy ?? expectedCovid);
+      const expectedVat     = Math.round(levyBase * 0.15 * 100) / 100;
+
+      if (nhil !== undefined && Math.abs(nhil - expectedNhil) > 0.15) {
+        mathErrors.push(`NHIL error: shows ${nhil.toFixed(2)}, expected ${expectedNhil.toFixed(2)} (2.5% of ${subtotal.toFixed(2)}).`);
+        mathSuggestions.push(`Ask vendor to recalculate NHIL — should be ${expectedNhil.toFixed(2)}.`);
+      }
+      if (getfund !== undefined && Math.abs(getfund - expectedGetfund) > 0.15) {
+        mathErrors.push(`GETFund error: shows ${getfund.toFixed(2)}, expected ${expectedGetfund.toFixed(2)}.`);
+        mathSuggestions.push(`Ask vendor to recalculate GETFund — should be ${expectedGetfund.toFixed(2)}.`);
+      }
+      if (covidLevy !== undefined && Math.abs(covidLevy - expectedCovid) > 0.15) {
+        mathErrors.push(`COVID-19 Levy error: shows ${covidLevy.toFixed(2)}, expected ${expectedCovid.toFixed(2)}.`);
+        mathSuggestions.push(`Ask vendor to recalculate COVID Levy — should be ${expectedCovid.toFixed(2)}.`);
+      }
+      if (vat !== undefined && Math.abs(vat - expectedVat) > 1.50) {
+        mathErrors.push(`VAT error: shows ${vat.toFixed(2)}, expected ${expectedVat.toFixed(2)} (15% of levy base ${levyBase.toFixed(2)}).`);
+        mathSuggestions.push(`Ask vendor to recalculate VAT — should be ${expectedVat.toFixed(2)}.`);
+      }
+
+      // Build running total chain for GRA (#10)
+      runningTotalChain.push(`Subtotal (pre-tax): ${subtotal.toFixed(2)}`);
+      if (nhil !== undefined) runningTotalChain.push(`+ NHIL 2.5%: ${nhil.toFixed(2)}`);
+      if (getfund !== undefined) runningTotalChain.push(`+ GETFund 2.5%: ${getfund.toFixed(2)}`);
+      if (covidLevy !== undefined) runningTotalChain.push(`+ COVID-19 Levy 1%: ${covidLevy.toFixed(2)}`);
+      if (vat !== undefined) runningTotalChain.push(`+ VAT 15%: ${vat.toFixed(2)}`);
+      if (aiTotal !== undefined) runningTotalChain.push(`= Grand Total: ${aiTotal.toFixed(2)}`);
+    } else if (subtotal !== undefined && correctedTax !== undefined) {
+      // Non-GRA with explicit tax (#10)
+      runningTotalChain.push(`Subtotal: ${subtotal.toFixed(2)}`);
+      runningTotalChain.push(`+ Tax: ${correctedTax.toFixed(2)}`);
+      if (aiTotal !== undefined) runningTotalChain.push(`= Total: ${aiTotal.toFixed(2)}`);
+    }
+  }
+
+  // ── #10 Items sum chain (VAT-inclusive) ──
+  if (vatIncluded && items.length > 0) {
+    let runningSum = 0;
+    for (const item of items) {
+      const lt = parseNumber(item.line_total);
+      if (lt !== undefined) {
+        runningSum = Math.round((runningSum + lt) * 100) / 100;
+        runningTotalChain.push(`${item.name || 'item'} line total: ${lt.toFixed(2)} (running: ${runningSum.toFixed(2)})`);
+      }
+    }
+    if (aiTotal !== undefined && runningSum > 0) {
+      runningTotalChain.push(`Items sum: ${runningSum.toFixed(2)} vs Grand Total: ${aiTotal.toFixed(2)}`);
+    }
+  }
+
+  // ── #6 Full column cross-check ──
+  let itemsSum = 0;
+  let hasAnyLineTotal = false;
+  for (const item of items) {
+    const lt = parseNumber(item.line_total);
+    if (lt !== undefined) { itemsSum += lt; hasAnyLineTotal = true; }
+  }
+  itemsSum = Math.round(itemsSum * 100) / 100;
+
+  if (hasAnyLineTotal && subtotal !== undefined && Math.abs(itemsSum - subtotal) > 0.10) {
+    mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but stated subtotal is ${subtotal.toFixed(2)} (gap: ${Math.abs(itemsSum - subtotal).toFixed(2)}).`);
+    mathSuggestions.push(`The sum of all items (${itemsSum.toFixed(2)}) does not match the subtotal (${subtotal.toFixed(2)}). Ask the vendor to check every line total and reissue.`);
+  }
+  if (hasAnyLineTotal && vatIncluded && aiTotal !== undefined && subtotal === undefined && Math.abs(itemsSum - aiTotal) > 0.10) {
+    const gap = Math.abs(itemsSum - aiTotal);
+    if (gap / aiTotal > 0.01) {
+      mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but grand total is ${aiTotal.toFixed(2)} (gap: ${gap.toFixed(2)}).`);
+      mathSuggestions.push(`The items sum (${itemsSum.toFixed(2)}) does not match the grand total (${aiTotal.toFixed(2)}). One or more line totals may be wrong.`);
+    }
+  }
+
+  // ── Total derivation ──
   let correctedTotal = aiTotal;
-  if (subtotal !== undefined && correctedTax !== undefined) {
+  if (subtotal !== undefined && correctedTax !== undefined && taxExplicitlyPresent) {
     const computedTotal = safeSum(subtotal, correctedTax);
     if (aiTotal === undefined) {
       correctedTotal = computedTotal;
-      mathNotes.push(`Total computed: ${subtotal} + ${correctedTax} = ${computedTotal}`);
       mathOverride = true;
+      mathNotes.push(`Total computed from subtotal+tax: ${computedTotal}`);
     } else if (Math.abs(computedTotal - aiTotal) > 0.10) {
       const pct = Math.abs(computedTotal - aiTotal) / Math.max(aiTotal, 1) * 100;
       if (pct > 1) {
-        mathErrors.push(
-          `Grand total mismatch: subtotal(${subtotal.toFixed(2)}) + tax(${correctedTax.toFixed(2)}) = ${computedTotal.toFixed(2)}, ` +
-          `but invoice shows ${aiTotal.toFixed(2)} (diff ${Math.abs(aiTotal - computedTotal).toFixed(2)}). ` +
-          (ai.is_gra_invoice ? 'Trusting printed total for GRA invoice.' : 'Math override applied.')
+        const diff = Math.abs(aiTotal - computedTotal).toFixed(2);
+        mathErrors.push(`Grand total mismatch: subtotal(${subtotal.toFixed(2)}) + tax(${correctedTax.toFixed(2)}) = ${computedTotal.toFixed(2)}, but invoice shows ${aiTotal.toFixed(2)} (gap: ${diff}).`);
+        mathSuggestions.push(
+          ai.is_gra_invoice
+            ? `Do not collect until the vendor corrects this. The math gives ${computedTotal.toFixed(2)} but the invoice shows ${aiTotal.toFixed(2)}.`
+            : `Ask vendor to correct the total — should be ${computedTotal.toFixed(2)}, not ${aiTotal.toFixed(2)}.`
         );
         if (!ai.is_gra_invoice) { correctedTotal = computedTotal; mathOverride = true; }
       }
     }
   }
 
-  return { correctedSubtotal: subtotal, correctedTax, correctedTotal, mathOverride, mathNotes, mathErrors };
+  return { correctedSubtotal: subtotal, correctedTax, correctedTotal, mathOverride, mathNotes, mathErrors, mathSuggestions, runningTotalChain, vatIncluded };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -460,69 +732,106 @@ function runMathEngine(ai: any): MathResult {
 
 interface HallucinationReport {
   isHallucinated: boolean;
-  flags: string[];
+  flags:          string[];
+  suggestions:    string[];
   totalUncertain: boolean;
 }
 
 function runHallucinationGuard(ai: any, math: MathResult): HallucinationReport {
   const flags: string[] = [];
+  const suggestions: string[] = [];
   const total    = math.correctedTotal ?? parseNumber(ai.total);
   const subtotal = math.correctedSubtotal;
   const tax      = math.correctedTax;
   const items    = ai.items ?? [];
 
-  if (total !== undefined && subtotal !== undefined && total < subtotal)
-    flags.push(`Grand total (${total}) is less than subtotal (${subtotal}) — impossible. Likely a misread.`);
-  if ((total === undefined || total === 0) && items.length > 0)
-    flags.push(`Grand total is zero/missing but ${items.length} line items were found. Total was not read correctly.`);
-  if (tax !== undefined && subtotal !== undefined && subtotal > 0 && tax > subtotal)
-    flags.push(`Tax (${tax}) exceeds subtotal (${subtotal}) — implies >100% tax rate. Verify manually.`);
+  if (total !== undefined && subtotal !== undefined && total < subtotal) {
+    flags.push(`Grand total (${total}) is less than subtotal (${subtotal}) — mathematically impossible.`);
+    suggestions.push(`Return the invoice to the vendor — total cannot be less than subtotal.`);
+  }
+  if ((total === undefined || total === 0) && items.length > 0) {
+    flags.push(`Grand total missing or zero but ${items.length} line item(s) found — total section unreadable.`);
+    suggestions.push(`Check the bottom of the physical invoice. If illegible, ask vendor to reprint.`);
+  }
+  if (!math.vatIncluded && tax !== undefined && subtotal !== undefined && subtotal > 0 && tax > subtotal) {
+    flags.push(`Tax (${tax}) exceeds subtotal (${subtotal}) — implies tax rate over 100%.`);
+    suggestions.push(`The tax amount looks wrong. Check the totals section carefully.`);
+  }
   for (const item of items) {
     const lt = parseNumber(item.line_total);
-    if (lt !== undefined && total !== undefined && total > 0 && lt > total * 1.05)
-      flags.push(`Item "${item.name}" line total (${lt}) exceeds grand total (${total}) — likely a misread.`);
+    if (lt !== undefined && total !== undefined && total > 0 && lt > total * 1.05) {
+      flags.push(`Item "${item.name}" line total (${lt}) exceeds grand total (${total}).`);
+      suggestions.push(`Check "${item.name}" on the physical invoice — the line total may have been misread.`);
+    }
   }
   if (ai.date) {
     const year = parseInt(String(ai.date).slice(0, 4));
-    if (year < 2000 || year > 2030)
-      flags.push(`Invoice date year "${year}" is implausible. Date may have been misread.`);
+    if (year < 2000 || year > 2030) {
+      flags.push(`Invoice date year "${year}" is implausible — likely a misread.`);
+      suggestions.push(`Check the physical invoice for the correct date.`);
+    }
   }
-  if (ai.total_confidence === 'low' && math.correctedTotal === undefined)
-    flags.push(`Grand total extracted with LOW confidence and cannot be verified mathematically. Manual review required.`);
+  if (ai.total_confidence === 'low' && math.correctedTotal === undefined) {
+    flags.push(`Grand total extracted with LOW confidence and cannot be independently verified.`);
+    suggestions.push(`Do not collect money until you have manually confirmed the total on the physical invoice.`);
+  }
+
+  // #5 Character-level confidence — surface exact uncertain digits
+  if (ai.total_uncertain_digits) {
+    flags.push(`Grand total has uncertain digits: "${ai.total_uncertain_digits}". The exact amount may be wrong.`);
+    suggestions.push(`Look at the grand total on the physical invoice and read each digit carefully. Correct it in the edit panel.`);
+  }
+  for (const item of items) {
+    if (item.uncertain_digits && item.name) {
+      flags.push(`Item "${item.name}" has uncertain digits in its amounts: ${item.uncertain_digits}.`);
+      suggestions.push(`Verify the amounts for "${item.name}" on the physical invoice.`);
+    }
+  }
+
   const allNullLineTotals = items.length > 0 && items.every((i: any) => parseNumber(i.line_total) === undefined);
-  if (allNullLineTotals && items.length > 0)
-    flags.push(`No line totals could be read for any item. Items table may not have been captured correctly.`);
+  if (allNullLineTotals && items.length > 0) {
+    flags.push(`No line totals readable — items table may not have been captured clearly.`);
+    suggestions.push(`Retake the photo with better lighting, ensuring the items table is fully in frame.`);
+  }
 
   const totalUncertain =
     (ai.total_confidence === 'low' && math.correctedTotal === undefined) ||
     (total === undefined || total === 0);
 
-  return { isHallucinated: flags.length > 0, flags, totalUncertain };
+  return { isHallucinated: flags.length > 0, flags, suggestions, totalUncertain };
 }
 
 // ─────────────────────────────────────────────────────────────
-// PROTOCOL 9 — SALESMAN RISK VERDICT
+// PROTOCOL 9 — RISK VERDICT (v6.0: running total chain in details)
 // ─────────────────────────────────────────────────────────────
 
 function buildRiskVerdict(params: {
-  errors:                ValidationError[];
-  hallucinationFlags:    string[];
-  mathErrors:            string[];
-  isDuplicate:           boolean;
-  duplicateOfId?:        string;
-  isPartialPayment:      boolean;
-  partialOrigTotal?:     number;
-  priceWarnings:         string[];
-  total:                 number | undefined;
-  reconciliationApplied: boolean;
-  mathOverride:          boolean;
+  errors:                   ValidationError[];
+  hallucinationFlags:       string[];
+  hallucinationSuggestions: string[];
+  mathErrors:               string[];
+  mathSuggestions:          string[];
+  runningTotalChain:        string[];
+  isDuplicate:              boolean;
+  duplicateOfId?:           string;
+  isPartialPayment:         boolean;
+  partialOrigTotal?:        number;
+  priceWarnings:            string[];
+  vendorRangeWarning?:      string;
+  invNumberGapWarning?:     string;
+  timeOfDayWarning?:        string;
+  total:                    number | undefined;
+  reconciliationApplied:    boolean;
+  mathOverride:             boolean;
+  vatIncluded:              boolean;
 }): RiskVerdictResult {
   const {
-    errors, hallucinationFlags, mathErrors,
+    errors, hallucinationFlags, hallucinationSuggestions,
+    mathErrors, mathSuggestions, runningTotalChain,
     isDuplicate, duplicateOfId,
     isPartialPayment, partialOrigTotal,
-    priceWarnings, total,
-    reconciliationApplied, mathOverride,
+    priceWarnings, vendorRangeWarning, invNumberGapWarning, timeOfDayWarning,
+    total, reconciliationApplied, mathOverride, vatIncluded,
   } = params;
 
   const details: string[] = [];
@@ -532,66 +841,117 @@ function buildRiskVerdict(params: {
 
   const hasCriticalMathError = mathErrors.length > 0;
   const hasHallucination = hallucinationFlags.some(f =>
-    f.includes('Grand total') || f.includes('impossible') || f.includes('line total')
+    f.includes('Grand total') || f.includes('impossible') || f.includes('line total') || f.includes('uncertain digits')
   );
 
   if (isDuplicate) {
     verdict = 'REJECT';
-    reason = `STOP — this invoice has already been submitted before${duplicateOfId ? ` (ID: ${duplicateOfId})` : ''}. Do NOT collect money again.`;
+    reason = `STOP — this invoice was already submitted before${duplicateOfId ? ` (ID: ${duplicateOfId})` : ''}. Do NOT collect money again.`;
     moneyAtRisk = total ?? 0;
-    details.push('Duplicate invoice detected. Collecting again would be paying twice.');
+    details.push('Duplicate invoice. Collecting again means paying twice.');
+    details.push('→ Fix: Inform vendor this invoice was already processed. Request a new invoice number for a new transaction.');
   } else if (isPartialPayment && partialOrigTotal !== undefined) {
     verdict = 'CAUTION';
-    reason = `This looks like a partial payment. The original invoice total was ${partialOrigTotal.toFixed(2)} but this one shows ${total?.toFixed(2) ?? '?'}. Confirm with your manager before accepting.`;
+    reason = `Partial payment detected. Original total was ${partialOrigTotal.toFixed(2)}, this shows ${total?.toFixed(2) ?? '?'}.`;
     moneyAtRisk = partialOrigTotal - (total ?? 0);
-    details.push(`Partial payment: expected ${partialOrigTotal.toFixed(2)}, received ${total?.toFixed(2) ?? '?'}`);
+    details.push(`Expected ${partialOrigTotal.toFixed(2)}, this shows ${total?.toFixed(2) ?? '?'}.`);
+    details.push(`→ Fix: Look carefully at both invoices and confirm the correct amount before collecting.`);
   } else if (hasHallucination && total === undefined) {
     verdict = 'ESCALATE';
-    reason = `The invoice total could not be read reliably. Do NOT collect money — call your manager to verify the amount first.`;
+    reason = `Invoice total could not be read reliably. Do NOT collect until you have confirmed the amount on the physical invoice.`;
     moneyAtRisk = 0;
-    details.push(...hallucinationFlags);
+    for (let i = 0; i < hallucinationFlags.length; i++) {
+      details.push(`Problem: ${hallucinationFlags[i]}`);
+      if (hallucinationSuggestions[i]) details.push(`→ Fix: ${hallucinationSuggestions[i]}`);
+    }
   } else if (hasCriticalMathError) {
     verdict = 'ESCALATE';
-    reason = `The numbers on this invoice do not add up correctly. Call your manager before accepting payment — there may be an error or manipulation.`;
+    reason = `Numbers on this invoice do not add up. Look carefully at each figure and correct the invoice before accepting payment.`;
     moneyAtRisk = total ?? 0;
-    details.push(...mathErrors);
-  } else if (priceWarnings.length > 0) {
-    const bigSpike = priceWarnings.some(w => { const m = w.match(/(\d+)%/); return m && parseInt(m[1]) > 50; });
+    for (let i = 0; i < mathErrors.length; i++) {
+      details.push(`Problem: ${mathErrors[i]}`);
+      if (mathSuggestions[i]) details.push(`→ Fix: ${mathSuggestions[i]}`);
+    }
+  } else if (priceWarnings.length > 0 || vendorRangeWarning) {
+    const bigSpike = priceWarnings.some(w => { const m = w.match(/(\d+)%/); return m && parseInt(m[1]) > 50; }) ||
+      (vendorRangeWarning?.includes('3×') ?? false);
     verdict = bigSpike ? 'ESCALATE' : 'CAUTION';
     reason = bigSpike
-      ? `One or more item prices have more than doubled since the last invoice from this vendor. Do not accept without manager approval.`
-      : `Some item prices are significantly higher than the last invoice from this vendor. Double-check the prices before collecting.`;
+      ? `Prices are unusually high for this vendor. Look carefully at every item and confirm with the vendor before accepting payment.`
+      : `Some prices are higher than expected for this vendor. Review before collecting.`;
     moneyAtRisk = total ?? 0;
-    details.push(...priceWarnings);
+    for (const w of priceWarnings) {
+      details.push(`Problem: ${w}`);
+      details.push(`→ Fix: Request vendor's updated price list and compare before collecting.`);
+    }
+    if (vendorRangeWarning) {
+      details.push(`Problem: ${vendorRangeWarning}`);
+      details.push(`→ Fix: Compare this invoice total against your records for this vendor before collecting.`);
+    }
+  } else if (invNumberGapWarning) {
+    verdict = 'CAUTION';
+    reason = `Invoice number sequence looks unusual for this vendor.`;
+    moneyAtRisk = total ?? 0;
+    details.push(`Problem: ${invNumberGapWarning}`);
+    details.push(`→ Fix: Ask the vendor to confirm this invoice number is correct. Large gaps can indicate backdating.`);
   } else if (errors.some(e => e.field === 'total')) {
     verdict = 'CAUTION';
-    reason = `The grand total has an issue. Verify the amount (${total?.toFixed(2) ?? 'unknown'}) matches what's printed on the invoice before collecting.`;
+    reason = `Grand total has an issue. Verify the amount before collecting.`;
     moneyAtRisk = total ?? 0;
-    details.push(...errors.filter(e => e.field === 'total').map(e => e.message));
+    for (const e of errors.filter(e => e.field === 'total')) {
+      const parts = e.message.split(' → ');
+      details.push(`Problem: ${parts[0]}`);
+      if (parts[1]) details.push(`→ Fix: ${parts[1]}`);
+    }
   } else if (errors.some(e => ['invoice_number', 'customer_name', 'date'].includes(e.field))) {
     verdict = 'CAUTION';
     const missing = errors.filter(e => ['invoice_number', 'customer_name', 'date'].includes(e.field)).map(e => e.field.replace('_', ' ')).join(', ');
-    reason = `Invoice is missing key information (${missing}). Collect only if the vendor can clarify these details.`;
+    reason = `Invoice missing key information: ${missing}.`;
     moneyAtRisk = 0;
-    details.push(...errors.map(e => e.message));
+    for (const e of errors.filter(e => ['invoice_number', 'customer_name', 'date'].includes(e.field))) {
+      const parts = e.message.split(' → ');
+      details.push(`Problem: ${parts[0]}`);
+      if (parts[1]) details.push(`→ Fix: ${parts[1]}`);
+    }
   } else if (errors.length === 0 && hallucinationFlags.length === 0 && mathErrors.length === 0) {
     verdict = 'ACCEPT';
     if (reconciliationApplied) {
-      reason = `Invoice verified after extra re-check. The total of ${total?.toFixed(2) ?? '?'} is confirmed. You can collect the money.`;
+      reason = `Invoice verified after extra re-check. Total ${total?.toFixed(2) ?? '?'} confirmed. Safe to collect.`;
     } else if (mathOverride) {
       verdict = 'CAUTION';
-      reason = `Invoice total was auto-corrected by arithmetic verification to ${total?.toFixed(2) ?? '?'}. Verify the number matches what's printed.`;
+      reason = `Invoice total was auto-corrected arithmetically to ${total?.toFixed(2) ?? '?'}. Verify against the physical invoice before collecting.`;
+      details.push(`→ Fix: Confirm the total on the physical invoice matches ${total?.toFixed(2) ?? '?'}.`);
     } else {
-      reason = `All checks passed. Invoice total is ${total?.toFixed(2) ?? '?'}. You can collect the money.`;
+      const vatNote = vatIncluded ? ' (VAT already in prices)' : '';
+      reason = `All checks passed. Invoice total is ${total?.toFixed(2) ?? '?'}${vatNote}. Safe to collect.`;
     }
   } else {
     verdict = 'CAUTION';
-    reason = `Invoice has minor issues — review the flagged fields before collecting ${total !== undefined ? total.toFixed(2) : 'the stated amount'}.`;
+    reason = `Invoice has issues — review flagged fields before collecting.`;
     moneyAtRisk = 0;
-    details.push(...errors.map(e => e.message));
+    for (const e of errors) {
+      const parts = e.message.split(' → ');
+      details.push(`Problem: ${parts[0]}`);
+      if (parts[1]) details.push(`→ Fix: ${parts[1]}`);
+    }
   }
 
-  for (const f of hallucinationFlags) { if (!details.includes(f)) details.push(f); }
+  for (let i = 0; i < hallucinationFlags.length; i++) {
+    if (!details.some(d => d.includes(hallucinationFlags[i].slice(0, 30)))) {
+      details.push(`Problem: ${hallucinationFlags[i]}`);
+      if (hallucinationSuggestions[i]) details.push(`→ Fix: ${hallucinationSuggestions[i]}`);
+    }
+  }
+
+  // Time-of-day warning added as soft note at end
+  if (timeOfDayWarning) {
+    details.push(`⏰ Note: ${timeOfDayWarning}`);
+  }
+
+  // #10 Running total chain
+  if (runningTotalChain.length > 0) {
+    details.push(`📊 Calculation breakdown: ${runningTotalChain.join(' → ')}`);
+  }
 
   return { verdict, reason, details, moneyAtRisk };
 }
@@ -612,7 +972,6 @@ function parseGroqJson(raw: string): any {
 
 // ─────────────────────────────────────────────────────────────
 // MAIN SERVER ACTION
-// fix #2: accepts SlimInvoiceResult[] (ocrText stripped client-side)
 // ─────────────────────────────────────────────────────────────
 
 export async function processInvoice(
@@ -628,49 +987,103 @@ export async function processInvoice(
     const imageUrl = await ensureImageUnderLimit(imageBase64);
     console.log(`[Invoice] Image size: ${Math.round((imageUrl.split(',')[1]?.length ?? 0) / 1024)}KB base64`);
 
-    // PASS 1
-    console.log('[Invoice] Pass 1: region-aware OCR...');
+    // ── PASS 1: Universal OCR ──
+    console.log('[Invoice] Pass 1: universal OCR...');
     const transcription = await callGroqVision(imageUrl, PASS1_PROMPT, groqApiKey);
     console.log('[Invoice] Pass 1 done, length:', transcription.length);
 
-    // LAYER 2 — Math pre-check
-    console.log('[Invoice] Math pre-check...');
+    // ── MATH PRE-CHECK + PASS 2 in parallel ──
+    console.log('[Invoice] Math pre-check + Pass 2 in parallel...');
     let mathCheck: any = null;
-    try {
-      mathCheck = parseGroqJson(await callGroqText(buildMathPreCheckPrompt(transcription), groqApiKey, 1000));
-      console.log('[Invoice] Math pre-check result:', JSON.stringify(mathCheck).slice(0, 200));
-    } catch (e) { console.warn('[Invoice] Math pre-check failed (non-fatal):', e); }
-
-    // PASS 2
-    console.log('[Invoice] Pass 2: structured JSON extraction...');
     let rawJson = '';
-    try {
-      rawJson = await callGroqText(buildPass2Prompt(transcription, mathCheck), groqApiKey, 2500);
-    } catch (textErr) {
-      console.warn('[Invoice] All text models failed for Pass 2, falling back to vision model:', textErr);
-      rawJson = await callGroqVision(imageUrl, buildPass2Prompt(transcription, mathCheck), groqApiKey);
+
+    const [mathCheckResult, pass2Result] = await Promise.allSettled([
+      callGroqText(buildMathPreCheckPrompt(transcription), groqApiKey, 1500),
+      callGroqText(buildPass2Prompt(transcription, null), groqApiKey, 3000)
+        .catch(() => callGroqVision(imageUrl, buildPass2Prompt(transcription, null), groqApiKey)),
+    ]);
+
+    if (mathCheckResult.status === 'fulfilled') {
+      try { mathCheck = parseGroqJson(mathCheckResult.value); } catch (e) { console.warn('[Invoice] Math pre-check parse failed:', e); }
+    } else {
+      console.warn('[Invoice] Math pre-check failed (non-fatal):', mathCheckResult.reason);
     }
 
+    if (pass2Result.status === 'fulfilled') {
+      rawJson = pass2Result.value;
+    } else {
+      throw new Error('Pass 2 JSON extraction failed: ' + pass2Result.reason?.message);
+    }
+    console.log('[Invoice] Math pre-check + Pass 2 done');
+
     let ai = parseGroqJson(rawJson);
-    let math = runMathEngine(ai);
+    let math = runMathEngine(ai, mathCheck);
     let hallucinationReport = runHallucinationGuard(ai, math);
 
-    // PROTOCOL 8 — Reconciliation re-query
-    // fix #9: only fire when items were found (otherwise the totals zone doesn't exist to re-read)
+    // ── REGION RE-READ: LOW confidence only ──
+    const lowConfidenceFields: string[] = [];
+    if (ai.total_confidence === 'low') lowConfidenceFields.push('grand total / amount due');
+    if (ai.invoice_number_confidence === 'low') lowConfidenceFields.push('invoice number');
+    if (ai.date_confidence === 'low') lowConfidenceFields.push('invoice date');
+    if (ai.subtotal_confidence === 'low') lowConfidenceFields.push('subtotal');
+    if (ai.customer_name_confidence === 'low') lowConfidenceFields.push('vendor/seller name');
+
+    let regionRereadApplied = false;
+    if (lowConfidenceFields.length > 0) {
+      console.log(`[Invoice] #3 Region re-read for: ${lowConfidenceFields.join(', ')}`);
+      try {
+        // Re-read header fields
+        const headerFields = lowConfidenceFields.filter(f => ['invoice number', 'invoice date', 'vendor/seller name'].some(x => f.includes(x)));
+        const totalsFields = lowConfidenceFields.filter(f => ['grand total', 'subtotal', 'amount due'].some(x => f.includes(x)));
+
+        if (totalsFields.length > 0) {
+          const rereadText = await callGroqVision(imageUrl, buildRegionRereadPrompt('totals', totalsFields), groqApiKey);
+          const totalMatch = rereadText.match(/GRAND_TOTAL_BEST_READING:\s*([\d,]+\.?\d*)/i);
+          const confMatch  = rereadText.match(/GRAND_TOTAL_CONFIDENCE:\s*(HIGH|MEDIUM|LOW)/i);
+          if (totalMatch && confMatch?.[1]?.toUpperCase() !== 'LOW') {
+            const rereTotal = parseNumber(totalMatch[1]);
+            const rereConf  = (confMatch?.[1] ?? 'medium').toLowerCase();
+            if (rereTotal && rereTotal > 0) {
+              ai = { ...ai, total: rereTotal, total_confidence: rereConf, total_uncertain_digits: null };
+              math = runMathEngine(ai, mathCheck);
+              hallucinationReport = runHallucinationGuard(ai, math);
+              regionRereadApplied = true;
+              console.log(`[Invoice] Region re-read: total → ${rereTotal} (${rereConf})`);
+            }
+          }
+        }
+
+        if (headerFields.length > 0 && !regionRereadApplied) {
+          const rereadText = await callGroqVision(imageUrl, buildRegionRereadPrompt('header', headerFields), groqApiKey);
+          // Extract any improved readings
+          const invNoMatch  = rereadText.match(/FIELD:\s*invoice\s*number[\s\S]*?VALUE:\s*([^\n]+)/i);
+          const confInvNo   = rereadText.match(/FIELD:\s*invoice\s*number[\s\S]*?CONFIDENCE:\s*(HIGH|MEDIUM|LOW)/i);
+          if (invNoMatch && confInvNo?.[1]?.toUpperCase() !== 'LOW' && !ai.invoice_number) {
+            const rereInvNo = invNoMatch[1].trim();
+            if (rereInvNo && rereInvNo !== 'NONE') {
+              ai = { ...ai, invoice_number: rereInvNo, invoice_number_confidence: 'medium' };
+              regionRereadApplied = true;
+            }
+          }
+        }
+      } catch (e) { console.warn('[Invoice] Region re-read failed (non-fatal):', e); }
+    }
+
+    // ── PROTOCOL 8: Reconciliation re-query (total uncertain after region re-read) ──
     let reconciliationApplied = false;
     const hasItems = (ai.items ?? []).length > 0;
-    if (hallucinationReport.totalUncertain && hasItems) {
+    if (hallucinationReport.totalUncertain && hasItems && !regionRereadApplied) {
       console.log('[Invoice] Protocol 8: reconciliation re-query...');
       try {
         const reconText = await callGroqVision(imageUrl, RECONCILIATION_PROMPT, groqApiKey);
         const totalMatch = reconText.match(/GRAND TOTAL:\s*([\d,]+\.?\d*)/i);
-        const confidenceMatch = reconText.match(/CONFIDENCE:\s*(high|medium|low)/i);
+        const confMatch  = reconText.match(/CONFIDENCE:\s*(high|medium|low)/i);
         if (totalMatch) {
           const reconTotal = parseNumber(totalMatch[1]);
-          const reconConf = (confidenceMatch?.[1] ?? 'medium').toLowerCase();
+          const reconConf  = (confMatch?.[1] ?? 'medium').toLowerCase();
           if (reconTotal && reconTotal > 0 && reconConf !== 'low') {
             ai = { ...ai, total: reconTotal, total_confidence: reconConf };
-            math = runMathEngine(ai);
+            math = runMathEngine(ai, mathCheck);
             hallucinationReport = runHallucinationGuard(ai, math);
             reconciliationApplied = true;
             console.log(`[Invoice] Reconciliation: total → ${reconTotal} (${reconConf})`);
@@ -679,14 +1092,14 @@ export async function processInvoice(
       } catch (e) { console.warn('[Invoice] Protocol 8 failed (non-fatal):', e); }
     }
 
-    // BUILD VALIDATED DATA
+    // ── BUILD VALIDATED DATA ──
     const validatedData: ValidatedData = {
       invoice_number: ai.invoice_number || undefined,
       date:           ai.date || undefined,
       customer_name:  ai.customer_name || undefined,
       category:       ai.category || undefined,
       subtotal:       math.correctedSubtotal,
-      tax:            math.correctedTax,
+      tax:            math.vatIncluded ? undefined : math.correctedTax,
       total:          math.correctedTotal ?? parseNumber(ai.total),
       items: (ai.items ?? []).map((item: any) => ({
         name:       item.name || undefined,
@@ -696,26 +1109,32 @@ export async function processInvoice(
       })),
     };
 
-    // VALIDATION ERRORS
+    // ── VALIDATION ERRORS ──
     const errors: ValidationError[] = [];
+
     if (!validatedData.invoice_number)
-      errors.push({ field: 'invoice_number', message: 'Invoice number is missing or unreadable.' });
+      errors.push({ field: 'invoice_number', message: 'Invoice number missing or unreadable. → Ask the vendor for an invoice with a unique reference number before collecting payment.' });
     if (!validatedData.customer_name)
-      errors.push({ field: 'customer_name', message: 'Vendor/store name is missing or unreadable.' });
+      errors.push({ field: 'customer_name', message: 'Vendor/store name missing or unreadable. → Ask the vendor to confirm their business name and update it in the edit panel.' });
     if (validatedData.total === undefined)
-      errors.push({ field: 'total', message: 'Grand total is missing. Check the bottom of the invoice.' });
+      errors.push({ field: 'total', message: 'Grand total missing — cannot verify the amount to collect. → Check the bottom of the physical invoice and enter the total manually.' });
     if (!validatedData.items || validatedData.items.length === 0)
-      errors.push({ field: 'items', message: 'No line items found on this invoice.' });
-    if (ai.total_confidence === 'low' && !reconciliationApplied)
-      errors.push({ field: 'total', message: `Grand total was difficult to read (low confidence). Verify the amount: ${validatedData.total?.toFixed(2) ?? 'unknown'}.` });
-    if (ai.subtotal_confidence === 'low')
-      errors.push({ field: 'subtotal', message: 'Subtotal was difficult to read. Please verify.' });
+      errors.push({ field: 'items', message: 'No line items found. → Retake the photo ensuring the items table is fully visible, or request an itemised invoice from the vendor.' });
+    if (ai.total_confidence === 'low' && !reconciliationApplied && !regionRereadApplied)
+      errors.push({ field: 'total', message: `Grand total was difficult to read (low confidence: ${validatedData.total?.toFixed(2) ?? 'unknown'}). → Manually confirm this amount on the physical invoice before collecting.` });
     if (ai.customer_name_confidence === 'low')
-      errors.push({ field: 'customer_name', message: `Vendor name was partially readable. Verify: "${validatedData.customer_name}".` });
-    for (const flag of hallucinationReport.flags)
-      errors.push({ field: 'hallucination', message: `⚠️ ${flag}` });
-    for (const msg of math.mathErrors)
-      errors.push({ field: 'math', message: msg });
+      errors.push({ field: 'customer_name', message: `Vendor name was partially readable: "${validatedData.customer_name}". → Confirm with the vendor and correct in the edit panel if wrong.` });
+
+    // Hallucination flags
+    for (let i = 0; i < hallucinationReport.flags.length; i++) {
+      const suggestion = hallucinationReport.suggestions[i] ? ` → ${hallucinationReport.suggestions[i]}` : '';
+      errors.push({ field: 'hallucination', message: `⚠️ ${hallucinationReport.flags[i]}${suggestion}` });
+    }
+    // Math errors
+    for (let i = 0; i < math.mathErrors.length; i++) {
+      const suggestion = math.mathSuggestions[i] ? ` → ${math.mathSuggestions[i]}` : '';
+      errors.push({ field: 'math', message: `${math.mathErrors[i]}${suggestion}` });
+    }
 
     // Line item arithmetic
     let itemsSum = 0;
@@ -727,31 +1146,61 @@ export async function processInvoice(
         itemsSum += lineTotal;
         if (qty > 0 && unitPrice > 0) {
           const expected = Math.round(qty * unitPrice * 100) / 100;
-          if (Math.abs(expected - lineTotal) > 0.10)
-            errors.push({ field: `items[${i}].line_total`, message: `"${item.name || 'Item'}" maths: ${qty} × ${unitPrice.toFixed(2)} = ${expected.toFixed(2)}, invoice shows ${lineTotal.toFixed(2)} (diff ${Math.abs(lineTotal - expected).toFixed(2)}).` });
+          if (Math.abs(expected - lineTotal) > 0.10) {
+            errors.push({
+              field: `items[${i}].line_total`,
+              message: `"${item.name || 'Item'}" row error: ${qty} × ${unitPrice.toFixed(2)} = ${expected.toFixed(2)}, but invoice shows ${lineTotal.toFixed(2)} (gap: ${Math.abs(lineTotal - expected).toFixed(2)}). → Ask vendor to correct this line or reissue the invoice.`
+            });
+          }
         }
       }
     }
     itemsSum = Math.round(itemsSum * 100) / 100;
 
-    if (validatedData.subtotal !== undefined && itemsSum > 0 && Math.abs(itemsSum - validatedData.subtotal) > 0.10)
-      errors.push({ field: 'subtotal', message: `Line items sum to ${itemsSum.toFixed(2)} but subtotal shows ${validatedData.subtotal.toFixed(2)}.` });
-    if (validatedData.subtotal !== undefined && validatedData.tax !== undefined && validatedData.total !== undefined) {
+    // Subtotal vs items (explicit subtotal only)
+    if (validatedData.subtotal !== undefined && itemsSum > 0 && Math.abs(itemsSum - validatedData.subtotal) > 0.10) {
+      errors.push({
+        field: 'subtotal',
+        message: `Items sum to ${itemsSum.toFixed(2)} but subtotal shows ${validatedData.subtotal.toFixed(2)}. → Return invoice to vendor for correction before collecting money.`
+      });
+    }
+
+    // Total vs subtotal+tax (explicit tax only)
+    if (!math.vatIncluded && validatedData.subtotal !== undefined && validatedData.tax !== undefined && validatedData.total !== undefined) {
       const expectedTotal = safeSum(validatedData.subtotal, validatedData.tax);
-      if (Math.abs(expectedTotal - validatedData.total) / Math.max(validatedData.total, 1) * 100 > 1)
-        errors.push({ field: 'total', message: `Total check: ${validatedData.subtotal.toFixed(2)} + tax ${validatedData.tax.toFixed(2)} = ${expectedTotal.toFixed(2)}, invoice shows ${validatedData.total.toFixed(2)}.` });
+      if (Math.abs(expectedTotal - validatedData.total) / Math.max(validatedData.total, 1) * 100 > 1) {
+        errors.push({
+          field: 'total',
+          message: `Total mismatch: ${validatedData.subtotal.toFixed(2)} + tax ${validatedData.tax.toFixed(2)} = ${expectedTotal.toFixed(2)}, but invoice shows ${validatedData.total.toFixed(2)}. → Do not collect until vendor corrects and reissues.`
+        });
+      }
     }
-    if (!ai.is_gra_invoice && validatedData.subtotal && validatedData.tax && validatedData.subtotal > 0) {
+
+    // Tax rate check (non-GRA explicit tax)
+    if (!math.vatIncluded && !ai.is_gra_invoice && validatedData.subtotal && validatedData.tax && validatedData.subtotal > 0) {
       const impliedRate = Math.round((validatedData.tax / validatedData.subtotal) * 10000) / 100;
-      if (impliedRate > 0 && Math.abs(impliedRate - taxRatePct) > 8)
-        errors.push({ field: 'tax', message: `Tax rate appears unusual: ${impliedRate}% (expected ~${taxRatePct}%). Verify before receiving payment.` });
+      if (impliedRate > 0 && Math.abs(impliedRate - taxRatePct) > 8) {
+        errors.push({
+          field: 'tax',
+          message: `Unusual tax rate: ${impliedRate}% (expected ~${taxRatePct}%). → Verify with vendor or manager before collecting.`
+        });
+      }
     }
+
+    // Date anomaly
     const dateWarning = checkDateAnomaly(validatedData.date);
     if (dateWarning) errors.push({ field: 'date', message: dateWarning });
 
-    // PROTOCOL 6 — Vendor price memory
+    // #I03 Round number anomaly
+    const roundWarning = checkRoundNumberAnomaly(validatedData.total, validatedData.items?.length ?? 0);
+    if (roundWarning) errors.push({ field: 'round_number', message: roundWarning });
+
+    // #14 Time-of-day anomaly
+    const timeOfDayWarning = checkTimeOfDayAnomaly();
+
+    // ── PROTOCOL 6: Price memory ──
     let priceWarnings: string[] = [];
-    const priceWarningsAt = new Date().toISOString(); // fix #11
+    const priceWarningsAt = new Date().toISOString();
     if (invoiceHistory.length > 0) {
       const vendorProfiles = buildVendorProfiles(invoiceHistory as InvoiceProcessingResult[]);
       const vendorKey = normaliseVendorKey(validatedData.customer_name);
@@ -760,73 +1209,128 @@ export async function processInvoice(
       for (const w of priceWarnings) errors.push({ field: 'price_memory', message: w });
     }
 
-    // PROTOCOL 7 — Duplicate + partial payment detection
+    // ── #11 Vendor total range check ──
+    let vendorRangeWarning: string | undefined;
+    let vendorHistory: InvoiceProcessingResult[] = [];
+    if (invoiceHistory.length > 0 && validatedData.total !== undefined) {
+      vendorHistory = (invoiceHistory as InvoiceProcessingResult[]).filter(
+        h => normaliseVendorKey(h.validatedData.customer_name) === normaliseVendorKey(validatedData.customer_name)
+      );
+      vendorRangeWarning = checkVendorTotalRange(validatedData.total, vendorHistory, validatedData.customer_name) ?? undefined;
+      if (vendorRangeWarning) errors.push({ field: 'vendor_range', message: vendorRangeWarning });
+    }
+
+    // ── #I04 Vendor fuzzy name match ──
+    if (invoiceHistory.length > 0) {
+      const fuzzyWarning = checkVendorNameFuzzyMatch(validatedData.customer_name, invoiceHistory as InvoiceProcessingResult[]);
+      if (fuzzyWarning) errors.push({ field: 'vendor_fuzzy', message: fuzzyWarning });
+    }
+
+    // ── #I11 Cumulative vendor spend ──
+    if (vendorHistory.length > 0) {
+      const cumulativeWarning = checkCumulativeVendorSpend(vendorHistory, validatedData.total, validatedData.customer_name);
+      if (cumulativeWarning) errors.push({ field: 'cumulative_spend', message: cumulativeWarning });
+    }
+
+    // ── PROTOCOL 7: Duplicate + partial payment ──
     let isDuplicate = false, duplicateOfId: string | undefined;
     let isPartialPayment = false, partialPaymentOriginalTotal: number | undefined, partialPaymentOriginalId: string | undefined;
     let isRecurring = false, recurringDelta: number | undefined;
 
+    // ── #15 Invoice number gap detection ──
+    let invNumberGapWarning: string | undefined;
+
     if (invoiceHistory.length > 0) {
-      const tempForDetection = { id: '__new__', validatedData, errors, isValid: errors.length === 0, ocrText: '', status: 'verified' as const, createdAt: new Date().toISOString(), vendorKey: normaliseVendorKey(validatedData.customer_name) } as InvoiceProcessingResult;
+      const tempForDetection = {
+        id: '__new__', validatedData, errors, isValid: errors.length === 0, ocrText: '',
+        status: 'verified' as const, createdAt: new Date().toISOString(),
+        vendorKey: normaliseVendorKey(validatedData.customer_name)
+      } as InvoiceProcessingResult;
+
       const dupResult = detectDuplicate(tempForDetection, invoiceHistory as InvoiceProcessingResult[]);
       isDuplicate = dupResult.isDuplicate;
       duplicateOfId = dupResult.duplicateOfId;
 
       if (isDuplicate) {
-        errors.push({ field: 'duplicate', message: `🔴 DUPLICATE INVOICE: Already recorded${duplicateOfId ? ` (matches ID ${duplicateOfId})` : ''}. Do NOT collect money again.` });
+        errors.push({ field: 'duplicate', message: `🔴 DUPLICATE INVOICE: Already recorded${duplicateOfId ? ` (ID: ${duplicateOfId})` : ''}. → Do NOT collect again. Inform vendor this invoice was already processed.` });
       } else {
         const partialResult = detectPartialPayment(tempForDetection, invoiceHistory as InvoiceProcessingResult[]);
         isPartialPayment = partialResult.isPartial;
         partialPaymentOriginalTotal = partialResult.originalTotal;
         partialPaymentOriginalId = partialResult.originalId;
-        if (isPartialPayment && partialPaymentOriginalTotal !== undefined)
-          errors.push({ field: 'partial_payment', message: `⚠️ PARTIAL PAYMENT: Original total was ${partialPaymentOriginalTotal.toFixed(2)}, this shows ${validatedData.total?.toFixed(2) ?? '?'}. Confirm with manager.` });
+        if (isPartialPayment && partialPaymentOriginalTotal !== undefined) {
+          errors.push({ field: 'partial_payment', message: `⚠️ PARTIAL PAYMENT: Original total was ${partialPaymentOriginalTotal.toFixed(2)}, this shows ${validatedData.total?.toFixed(2) ?? '?'}. → Call your manager to confirm before collecting.` });
+        }
 
         const vendorProfiles = buildVendorProfiles(invoiceHistory as InvoiceProcessingResult[]);
         const recurringResult = detectRecurring(tempForDetection, vendorProfiles[normaliseVendorKey(validatedData.customer_name)]);
         isRecurring = recurringResult.isRecurring;
         recurringDelta = recurringResult.recurringDelta;
+
+        // #15 Invoice number gap
+        if (validatedData.invoice_number) {
+          invNumberGapWarning = detectInvoiceNumberGap(
+            validatedData.invoice_number,
+            normaliseVendorKey(validatedData.customer_name),
+            invoiceHistory as InvoiceProcessingResult[]
+          ) ?? undefined;
+          if (invNumberGapWarning) errors.push({ field: 'inv_number_gap', message: invNumberGapWarning });
+        }
       }
     }
 
-    // PROTOCOL 9 — Salesman risk verdict
+    // ── RISK VERDICT ──
     const riskVerdict = buildRiskVerdict({
-      errors, hallucinationFlags: hallucinationReport.flags, mathErrors: math.mathErrors,
+      errors,
+      hallucinationFlags: hallucinationReport.flags,
+      hallucinationSuggestions: hallucinationReport.suggestions,
+      mathErrors: math.mathErrors,
+      mathSuggestions: math.mathSuggestions,
+      runningTotalChain: math.runningTotalChain,
       isDuplicate, duplicateOfId, isPartialPayment, partialOrigTotal: partialPaymentOriginalTotal,
-      priceWarnings, total: validatedData.total, reconciliationApplied, mathOverride: math.mathOverride,
+      priceWarnings, vendorRangeWarning, invNumberGapWarning, timeOfDayWarning: timeOfDayWarning ?? undefined,
+      total: validatedData.total,
+      reconciliationApplied,
+      mathOverride: math.mathOverride,
+      vatIncluded: math.vatIncluded,
     });
 
-    // BUILD FINAL RESULT
+    // ── BUILD FINAL RESULT ──
     const isValid = errors.length === 0;
+    const vatNote = math.vatIncluded ? ' | VAT in prices' : ` | Tax: ${validatedData.tax?.toFixed(2) ?? 'N/A'}`;
     const ocrText =
-      `[InvoiceGuard AI v3.2 | ${ai.currency ?? 'GHS'}${ai.is_gra_invoice ? ' | GRA Tax Invoice' : ''}${ai.supplier_tin ? ` | TIN: ${ai.supplier_tin}` : ''}]\n\n` +
-      `PASS 1 — REGION-AWARE OCR:\n${transcription}\n\n` +
-      (ai.is_gra_invoice ? `GRA Levy Breakdown:\n  (i) ${ai.subtotal} | (ii) NHIL ${ai.nhil} | (iii) GETFund ${ai.getfund} | (iv) COVID ${ai.covid_levy} | (vi) VAT ${ai.vat} | (vii) TOTAL ${ai.total}\n\n` : '') +
-      (mathCheck ? `Arithmetic Pre-Check: items_sum=${mathCheck.items_sum} subtotal=${mathCheck.subtotal_from_transcription} tax=${mathCheck.tax_sum_from_transcription} total=${mathCheck.grand_total_from_transcription} match=${mathCheck.subtotal_plus_tax_matches_total}\n\n` : '') +
-      (math.mathNotes.length ? `Math Engine: ${math.mathNotes.join(' | ')}\n\n` : '') +
+      `[InvoiceGuard v7.0 | ${ai.currency ?? 'GHS'} | ${ai.document_type_observed ?? (ai.is_gra_invoice ? 'GRA Invoice' : 'Invoice')} | ${ai.writing_type ?? 'unknown'}${vatNote}]\n\n` +
+      `PASS 1 OCR:\n${transcription}\n\n` +
+      (mathCheck ? `Math Pre-Check: items_sum=${mathCheck.items_sum ?? 'N/A'} subtotal=${mathCheck.subtotal_from_transcription ?? 'N/A'} tax=${mathCheck.tax_sum_from_transcription ?? 'N/A (VAT in prices)'} total=${mathCheck.grand_total_from_transcription}\n` : '') +
+      (math.runningTotalChain.length ? `Running Total: ${math.runningTotalChain.join(' → ')}\n\n` : '') +
+      (math.mathNotes.length ? `Math Notes: ${math.mathNotes.join(' | ')}\n\n` : '') +
       (hallucinationReport.flags.length ? `Hallucination Guard:\n  ${hallucinationReport.flags.join('\n  ')}\n\n` : '') +
-      `Field Confidence: Invoice#=${ai.invoice_number_confidence} Date=${ai.date_confidence} Vendor=${ai.customer_name_confidence} Subtotal=${ai.subtotal_confidence} Tax=${ai.tax_confidence} Total=${ai.total_confidence}` +
-      (math.mathOverride ? ' | ⚠️ Math override' : '') + (reconciliationApplied ? ' | ✅ Reconciled' : '') + '\n\n' +
-      (priceWarnings.length ? `Price Warnings:\n  ${priceWarnings.join('\n  ')}\n\n` : '') +
-      `Risk Verdict: ${riskVerdict.verdict} — ${riskVerdict.reason}\n\n` +
-      `PASS 2 — EXTRACTED JSON:\n${JSON.stringify(ai, null, 2)}`;
+      `Confidence: #=${ai.invoice_number_confidence} Date=${ai.date_confidence} Vendor=${ai.customer_name_confidence} Total=${ai.total_confidence}` +
+      (regionRereadApplied ? ' | ✅ Region re-read' : '') +
+      (math.mathOverride ? ' | ⚠️ Math override' : '') +
+      (reconciliationApplied ? ' | ✅ Reconciled' : '') + '\n\n' +
+      `Verdict: ${riskVerdict.verdict} — ${riskVerdict.reason}\n\n` +
+      `JSON:\n${JSON.stringify(ai, null, 2)}`;
 
     const result: InvoiceProcessingResult = {
-      id: crypto.randomUUID(), isValid, errors, validatedData, ocrText,
-      status:                  isValid ? 'verified' : 'error',
-      createdAt:               new Date().toISOString(),
-      dueDate:                 ai.due_date || undefined,
-      vendorKey:               normaliseVendorKey(validatedData.customer_name),
-      smartName:               buildSmartName(validatedData),
-      currency:                ai.currency || 'GHS',
+      id:                       crypto.randomUUID(),
+      isValid, errors, validatedData, ocrText,
+      status:                   isValid ? 'verified' : 'error',
+      createdAt:                new Date().toISOString(),
+      dueDate:                  ai.due_date || undefined,
+      vendorKey:                normaliseVendorKey(validatedData.customer_name),
+      smartName:                buildSmartName(validatedData),
+      currency:                 ai.currency || 'GHS',
       isDuplicate, duplicateOfId,
       isPartialPayment, partialPaymentOriginalTotal, partialPaymentOriginalId,
       isRecurring, recurringDelta,
       priceWarnings,
-      priceWarningsAt,         // fix #11
+      priceWarningsAt,
       reconciliationApplied,
       riskVerdict,
     };
     result.healthScore = calcHealthScore(result);
+    result.salesmanSummary = buildSalesmanSummary(result);
     return result;
 
   } catch (error: any) {

@@ -8,7 +8,6 @@ import { calcHealthScore, healthLabel, daysUntilDue, dueDateStatus } from '@/lib
 import { shareViaWhatsApp, shareNative } from '@/lib/utils';
 import { HealthScoreBadge } from './health-score-badge';
 
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
@@ -18,7 +17,8 @@ import {
   ThumbsUp, ThumbsDown, CalendarClock, StickyNote,
   RefreshCw, AlertOctagon, ChevronDown, ChevronUp,
   Share2, MessageCircle, Calculator, ShieldCheck,
-  Ban, AlertCircle, TrendingUp,
+  Ban, AlertCircle, TrendingUp, Lightbulb,
+  PackageCheck, Diff, Send,
 } from 'lucide-react';
 import { ExportMenu } from './export-menu';
 
@@ -33,39 +33,38 @@ interface ResultsViewProps {
   currency?: string;
 }
 
-// ── CHECKLIST: what passed and what failed ──
 interface CheckItem {
   label: string;
   passed: boolean;
   detail?: string;
 }
 
+/** Split an error message on " → " to extract problem and suggestion */
+function splitErrorMessage(message: string): { problem: string; suggestion?: string } {
+  const parts = message.split(' → ');
+  return {
+    problem: parts[0].trim(),
+    suggestion: parts.length > 1 ? parts.slice(1).join(' → ').trim() : undefined,
+  };
+}
+
 function buildChecklist(result: InvoiceProcessingResult): CheckItem[] {
   const d = result.validatedData;
   const errorFields = new Set(result.errors.map(e => e.field));
   const items: CheckItem[] = [];
-
-  // Core fields
   items.push({ label: 'Invoice number', passed: !!d.invoice_number, detail: d.invoice_number ?? undefined });
   items.push({ label: 'Vendor name', passed: !!d.customer_name, detail: d.customer_name ?? undefined });
   items.push({ label: 'Invoice date', passed: !!d.date && !errorFields.has('date'), detail: d.date ?? undefined });
   items.push({ label: 'Line items found', passed: !!(d.items && d.items.length > 0), detail: d.items?.length ? `${d.items.length} item${d.items.length !== 1 ? 's' : ''}` : undefined });
-
-  // Totals
   items.push({ label: 'Grand total readable', passed: d.total !== undefined && !errorFields.has('total'), detail: d.total !== undefined ? d.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : undefined });
   items.push({ label: 'Subtotal present', passed: d.subtotal !== undefined, detail: d.subtotal !== undefined ? d.subtotal.toFixed(2) : undefined });
   items.push({ label: 'Tax present', passed: d.tax !== undefined, detail: d.tax !== undefined ? d.tax.toFixed(2) : undefined });
-
-  // Maths
   items.push({ label: 'Line items maths correct', passed: !result.errors.some(e => e.field.includes('line_total')) });
   items.push({ label: 'Subtotal + tax = total', passed: !errorFields.has('math') && !errorFields.has('hallucination') });
-
-  // Integrity
   items.push({ label: 'Not a duplicate', passed: !result.isDuplicate });
   items.push({ label: 'Not a partial payment', passed: !result.isPartialPayment });
   items.push({ label: 'No price spikes', passed: !(result.priceWarnings && result.priceWarnings.length > 0) });
   items.push({ label: 'AI reading confidence', passed: !result.errors.some(e => e.message.includes('confidence')) });
-
   return items;
 }
 
@@ -79,7 +78,7 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
   const itemCount = data.items?.length || 0;
   const category = data.category || 'General';
   const topItems = (data.items || []).filter(i => i.name).slice(0, 3)
-    .map(i => `${i.quantity !== undefined ? `${i.quantity}× ` : ''}${i.name}${i.line_total !== undefined ? ` (${i.line_total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })})` : ''}`);
+    .map(i => `${i.quantity !== undefined ? `${i.quantity}× ` : ''}${i.name}${i.line_total !== undefined ? ` (${i.line_total.toLocaleString(undefined, { minimumFractionDigits: 2 })})` : ''}`);
   const biggest = (data.items || []).filter(i => i.line_total !== undefined).sort((a, b) => (b.line_total || 0) - (a.line_total || 0))[0];
 
   const paragraphs: string[] = [
@@ -101,6 +100,7 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
 
   if (!isValid) {
     errors.forEach(err => {
+      const { problem } = splitErrorMessage(err.message);
       if (err.field === 'invoice_number') { warnings.push('No invoice number — cannot be tracked or disputed.'); actions.push('Request a proper invoice number before accepting payment.'); }
       else if (err.field === 'customer_name') { warnings.push('Customer name missing — identity unverifiable.'); actions.push('Confirm customer identity before proceeding.'); }
       else if (err.field === 'total') { warnings.push('Grand total unreadable — wrong amount risk.'); actions.push('Confirm the total before receiving money.'); }
@@ -108,8 +108,8 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
       else if (err.field.includes('line_total')) { warnings.push('Line item calculation error — possible overcharge.'); actions.push('Check every line: qty × unit price must match line total.'); }
       else if (err.field === 'subtotal') { warnings.push('Items do not add up to the stated subtotal.'); actions.push('Return the invoice for correction before receiving money.'); }
       else if (err.field === 'tax') { warnings.push('Tax rate is unusual for this region.'); actions.push('Verify the tax amount before receiving money.'); }
-      else if (err.field === 'date') { warnings.push(err.message); actions.push('Confirm the invoice date with the customer.'); }
-      else if (err.field === 'price_memory') { warnings.push(err.message); actions.push('Query the price change with the customer before approving.'); }
+      else if (err.field === 'date') { warnings.push(problem); actions.push('Confirm the invoice date with the customer.'); }
+      else if (err.field === 'price_memory') { warnings.push(problem); actions.push('Query the price change with the customer before approving.'); }
     });
   } else {
     actions.push('All figures verified. Safe to collect payment.');
@@ -123,7 +123,6 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
   return { headline, paragraphs, warnings, actions };
 }
 
-// ── VERDICT CONFIG ──
 const VERDICT_CONFIG = {
   ACCEPT:  { bg: 'bg-green-600',  border: 'border-green-500',  text: 'text-green-700 dark:text-green-300',  icon: ShieldCheck,  label: '🟢 ACCEPT — Collect the money'    },
   CAUTION: { bg: 'bg-amber-500',  border: 'border-amber-400',  text: 'text-amber-700 dark:text-amber-300',  icon: AlertCircle,  label: '🟡 CAUTION — Review before collecting' },
@@ -143,6 +142,13 @@ export const ResultsView = ({
   const [showRejectInput, setShowRejectInput] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [showAILog, setShowAILog] = useState(false);
+  // #13 delivery confirmation
+  const [deliveryChecked, setDeliveryChecked] = useState<boolean[]>([]);
+  const [showDeliveryCheck, setShowDeliveryCheck] = useState(false);
+  // #16 diff view
+  const [showDiffView, setShowDiffView] = useState(false);
+  // #20 send to manager
+  const [showManagerMsg, setShowManagerMsg] = useState(false);
 
   const errorFields = useMemo(() => {
     const fields = new Set<string>();
@@ -221,12 +227,9 @@ export const ResultsView = ({
   const isRejected = result.status === 'rejected';
   const canAct = !isApproved && !isRejected;
 
-  // Verdict
   const verdict = result.riskVerdict?.verdict ?? (result.isValid ? 'ACCEPT' : 'REJECT');
   const verdictCfg = VERDICT_CONFIG[verdict];
   const VerdictIcon = verdictCfg.icon;
-
-  // Top banner colours (legacy fallback for approved/rejected state)
   const verdictBg = isApproved ? 'bg-blue-600' : isRejected ? 'bg-gray-500' : verdictCfg.bg;
   const verdictText = isApproved ? 'Approved — Safe to Collect' : isRejected ? 'Invoice Rejected' : verdictCfg.label;
 
@@ -242,7 +245,6 @@ export const ResultsView = ({
           <VerdictIcon className="h-7 w-7 flex-shrink-0" />
           <p className="text-xl font-black leading-tight">{verdictText}</p>
         </div>
-        {/* Plain-English reason from Protocol 9 */}
         {result.riskVerdict && (
           <p className="text-sm font-semibold opacity-95 leading-snug bg-black/20 rounded-xl px-3 py-2">
             {result.riskVerdict.reason}
@@ -284,14 +286,13 @@ export const ResultsView = ({
         </div>
       </div>
 
-      {/* ── HEALTH SCORE BREAKDOWN BADGE ── */}
+      {/* ── HEALTH SCORE ── */}
       <div className="flex flex-wrap gap-2">
         <HealthScoreBadge result={result} />
       </div>
 
-      {/* ── CHECKLIST: GREEN TICKS + RED X's ── */}
+      {/* ── CHECKLIST: GREEN CHECKS + RED X's ── */}
       <div className="rounded-2xl border-2 border-border bg-card overflow-hidden">
-        {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/50">
           <span className="font-bold text-base flex items-center gap-2">
             <ShieldCheck className="h-5 w-5 text-primary" />
@@ -309,7 +310,6 @@ export const ResultsView = ({
           </div>
         </div>
 
-        {/* Checklist rows */}
         <div className="divide-y divide-border">
           {checklist.map((item, i) => (
             <div
@@ -346,7 +346,6 @@ export const ResultsView = ({
           ))}
         </div>
 
-        {/* All passed footer */}
         {failedCount === 0 && (
           <div className="px-4 py-3 bg-green-100 dark:bg-green-900/30 border-t border-green-200 dark:border-green-800">
             <p className="text-sm font-bold text-green-700 dark:text-green-300 flex items-center gap-2">
@@ -356,14 +355,14 @@ export const ResultsView = ({
         )}
       </div>
 
-      {/* ── ERRORS LIST (only shown when there are failures) ── */}
+      {/* ── ERRORS WITH PROBLEM + SUGGESTION ── */}
       {!result.isValid && result.errors.length > 0 && (
         <div className="rounded-2xl border-2 border-red-400 bg-red-50 dark:bg-red-950/30 overflow-hidden">
           <div className="flex items-center justify-between p-4 border-b border-red-200 dark:border-red-800">
             <div className="flex items-center gap-2">
               <XCircle className="h-6 w-6 text-red-600" />
               <span className="font-bold text-red-700 dark:text-red-400 text-base">
-                {result.errors.length} Error{result.errors.length !== 1 ? 's' : ''} Found
+                {result.errors.length} Issue{result.errors.length !== 1 ? 's' : ''} Found
               </span>
             </div>
             <button
@@ -373,13 +372,26 @@ export const ResultsView = ({
               <Copy className="h-3 w-3" /> Copy
             </button>
           </div>
-          <div className="p-3 space-y-2">
-            {result.errors.map((err, i) => (
-              <div key={i} className="flex items-start gap-3 bg-white dark:bg-red-950/40 rounded-xl p-3 border border-red-200 dark:border-red-800">
-                <XCircle className="h-5 w-5 text-red-500 flex-shrink-0 mt-0.5" />
-                <p className="text-sm text-red-800 dark:text-red-200 leading-snug">{err.message}</p>
-              </div>
-            ))}
+          <div className="p-3 space-y-3">
+            {result.errors.map((err, i) => {
+              const { problem, suggestion } = splitErrorMessage(err.message);
+              return (
+                <div key={i} className="bg-white dark:bg-red-950/40 rounded-xl border border-red-200 dark:border-red-800 overflow-hidden">
+                  {/* Problem */}
+                  <div className="flex items-start gap-3 p-3">
+                    <XCircle className="h-5 w-5 text-red-500 flex-shrink-0 mt-0.5" />
+                    <p className="text-sm text-red-800 dark:text-red-200 leading-snug font-medium">{problem}</p>
+                  </div>
+                  {/* Suggestion */}
+                  {suggestion && (
+                    <div className="flex items-start gap-3 px-3 pb-3 pt-0">
+                      <Lightbulb className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5 ml-0.5" />
+                      <p className="text-xs text-amber-700 dark:text-amber-300 leading-snug">{suggestion}</p>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -394,6 +406,9 @@ export const ResultsView = ({
               Same invoice number exists with a higher total of {fmt(result.partialPaymentOriginalTotal)}.
               Verify with customer whether this is a partial payment.
             </p>
+            <p className="text-xs text-amber-700 dark:text-amber-400 mt-2 font-semibold">
+              → Call your manager to confirm before collecting any money.
+            </p>
           </div>
         </div>
       )}
@@ -405,7 +420,185 @@ export const ResultsView = ({
           <div>
             <p className="font-black text-red-700 dark:text-red-400 text-base">Duplicate Invoice!</p>
             <p className="text-sm text-red-600 dark:text-red-300 mt-1">This invoice matches one already in your history. Do NOT collect payment twice.</p>
+            <p className="text-xs text-red-700 dark:text-red-400 mt-2 font-semibold">
+              → Inform the vendor this invoice was already processed. Request a new invoice if a new transaction occurred.
+            </p>
           </div>
+        </div>
+      )}
+
+      {/* ── #13 DELIVERY CONFIRMATION ── */}
+      {(editedData.items?.length ?? 0) > 0 && (
+        <div className="rounded-2xl border-2 border-indigo-300 bg-indigo-50 dark:bg-indigo-950/30 overflow-hidden">
+          <button
+            className="w-full flex items-center justify-between p-4 text-left active:bg-indigo-100"
+            onClick={() => {
+              if (!showDeliveryCheck) {
+                setDeliveryChecked(new Array(editedData.items!.length).fill(false));
+              }
+              setShowDeliveryCheck(v => !v);
+            }}
+          >
+            <span className="font-bold text-indigo-700 dark:text-indigo-300 flex items-center gap-2">
+              <PackageCheck className="h-5 w-5" />
+              Did you deliver everything on this invoice?
+            </span>
+            {showDeliveryCheck ? <ChevronUp className="h-4 w-4 text-indigo-500" /> : <ChevronDown className="h-4 w-4 text-indigo-500" />}
+          </button>
+          {showDeliveryCheck && (
+            <div className="px-4 pb-4 space-y-2 border-t border-indigo-200 dark:border-indigo-800">
+              <p className="text-xs text-indigo-600 dark:text-indigo-400 pt-3">Tick each item you physically delivered to the customer:</p>
+              {editedData.items!.map((item, idx) => (
+                <label key={idx} className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer border transition-colors ${
+                  deliveryChecked[idx]
+                    ? 'bg-green-100 border-green-300 dark:bg-green-900/30 dark:border-green-700'
+                    : 'bg-white border-indigo-200 dark:bg-indigo-950/20 dark:border-indigo-700'
+                }`}>
+                  <input
+                    type="checkbox"
+                    checked={!!deliveryChecked[idx]}
+                    onChange={e => {
+                      const next = [...deliveryChecked];
+                      next[idx] = e.target.checked;
+                      setDeliveryChecked(next);
+                    }}
+                    className="h-5 w-5 rounded accent-green-600"
+                  />
+                  <span className="flex-1 text-sm font-medium">
+                    {(item as any).quantity !== undefined ? `${(item as any).quantity}× ` : ''}
+                    {(item as any).name || `Item ${idx + 1}`}
+                    {(item as any).line_total !== undefined ? ` — ${Number((item as any).line_total).toLocaleString(undefined, { minimumFractionDigits: 2 })}` : ''}
+                  </span>
+                </label>
+              ))}
+              {deliveryChecked.length > 0 && deliveryChecked.some(c => !c) && (
+                <div className="mt-2 p-3 rounded-xl bg-orange-100 dark:bg-orange-900/30 border border-orange-300">
+                  <p className="text-sm font-bold text-orange-700 dark:text-orange-400 flex items-center gap-2">
+                    <AlertTriangle className="h-4 w-4" />
+                    {deliveryChecked.filter(c => !c).length} item(s) not ticked — do not approve until all goods are delivered.
+                  </p>
+                </div>
+              )}
+              {deliveryChecked.length > 0 && deliveryChecked.every(c => c) && (
+                <div className="mt-2 p-3 rounded-xl bg-green-100 dark:bg-green-900/30 border border-green-300">
+                  <p className="text-sm font-bold text-green-700 dark:text-green-400 flex items-center gap-2">
+                    <CheckCircle className="h-4 w-4" /> All items delivered — delivery confirmed.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── #16 DIFF VIEW: Invoice vs What Should Be ── */}
+      {!result.isValid && result.errors.some(e => e.field === 'math' || e.field.includes('line_total')) && (
+        <div className="rounded-2xl border-2 border-purple-300 bg-purple-50 dark:bg-purple-950/30 overflow-hidden">
+          <button
+            className="w-full flex items-center justify-between p-4 text-left active:bg-purple-100"
+            onClick={() => setShowDiffView(v => !v)}
+          >
+            <span className="font-bold text-purple-700 dark:text-purple-300 flex items-center gap-2">
+              <Diff className="h-5 w-5" />
+              Invoice vs Correct — Side-by-Side
+            </span>
+            {showDiffView ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+          </button>
+          {showDiffView && (
+            <div className="px-4 pb-4 border-t border-purple-200 dark:border-purple-800">
+              <div className="grid grid-cols-2 gap-3 pt-3">
+                <div>
+                  <p className="text-xs font-bold text-red-600 mb-2 uppercase tracking-wide">📄 On Invoice (wrong)</p>
+                  <div className="space-y-1">
+                    {(editedData.items || []).map((item, idx) => {
+                      const qty = parseFloat(String((item as any).quantity)) || 0;
+                      const unit = parseFloat(String((item as any).unit_price)) || 0;
+                      const lt   = parseFloat(String((item as any).line_total)) || 0;
+                      const hasError = qty > 0 && unit > 0 && Math.abs(qty * unit - lt) > 0.10;
+                      return (
+                        <div key={idx} className={`text-xs p-2 rounded-lg ${ hasError ? 'bg-red-100 dark:bg-red-950/40 font-bold text-red-800 dark:text-red-300' : 'bg-muted text-muted-foreground' }`}>
+                          {(item as any).name || `Item ${idx+1}`}: {lt.toFixed(2)}
+                        </div>
+                      );
+                    })}
+                    {editedData.subtotal !== undefined && <div className="text-xs p-2 bg-muted rounded-lg">Subtotal: {Number(editedData.subtotal).toFixed(2)}</div>}
+                    {editedData.total !== undefined && <div className="text-xs p-2 bg-red-100 dark:bg-red-950/40 rounded-lg font-bold text-red-800 dark:text-red-300">Total: {Number(editedData.total).toFixed(2)}</div>}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs font-bold text-green-600 mb-2 uppercase tracking-wide">✅ Should Be (correct)</p>
+                  <div className="space-y-1">
+                    {(editedData.items || []).map((item, idx) => {
+                      const qty = parseFloat(String((item as any).quantity)) || 0;
+                      const unit = parseFloat(String((item as any).unit_price)) || 0;
+                      const correct = qty > 0 && unit > 0 ? qty * unit : parseFloat(String((item as any).line_total)) || 0;
+                      const lt = parseFloat(String((item as any).line_total)) || 0;
+                      const hasError = qty > 0 && unit > 0 && Math.abs(correct - lt) > 0.10;
+                      return (
+                        <div key={idx} className={`text-xs p-2 rounded-lg ${ hasError ? 'bg-green-100 dark:bg-green-950/40 font-bold text-green-800 dark:text-green-300' : 'bg-muted text-muted-foreground' }`}>
+                          {(item as any).name || `Item ${idx+1}`}: {correct.toFixed(2)}
+                        </div>
+                      );
+                    })}
+                    {editedData.subtotal !== undefined && (
+                      <div className="text-xs p-2 bg-muted rounded-lg">
+                        Subtotal: {(editedData.items || []).reduce((s, i) => s + (parseFloat(String((i as any).line_total)) || 0), 0).toFixed(2)}
+                      </div>
+                    )}
+                    {suggestedTotal !== undefined && <div className="text-xs p-2 bg-green-100 dark:bg-green-950/40 rounded-lg font-bold text-green-800 dark:text-green-300">Total: {fmt(suggestedTotal)}</div>}
+                  </div>
+                </div>
+              </div>
+              <p className="text-xs text-purple-600 dark:text-purple-400 mt-3">→ Show this screen to the vendor and ask them to correct the highlighted amounts.</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── #20 SEND TO MANAGER ── */}
+      {(result.riskVerdict?.verdict === 'ESCALATE' || result.riskVerdict?.verdict === 'CAUTION') && (
+        <div className="rounded-2xl border-2 border-amber-300 bg-amber-50 dark:bg-amber-950/30 overflow-hidden">
+          <button
+            className="w-full flex items-center justify-between p-4 text-left"
+            onClick={() => setShowManagerMsg(v => !v)}
+          >
+            <span className="font-bold text-amber-700 dark:text-amber-300 flex items-center gap-2">
+              <Send className="h-5 w-5" />
+              Send to Manager
+            </span>
+            {showManagerMsg ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+          </button>
+          {showManagerMsg && (() => {
+            const vendor   = editedData.customer_name || 'Unknown Vendor';
+            const invNo    = editedData.invoice_number ? `#${editedData.invoice_number}` : '(no number)';
+            const total    = editedData.total !== undefined ? editedData.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : '?';
+            const verdict  = result.riskVerdict?.verdict ?? 'CAUTION';
+            const reason   = result.riskVerdict?.reason ?? 'Issues found.';
+            const problems = result.errors.slice(0, 3).map(e => e.message.split(' → ')[0].replace(/^[^w]*/,'')).join('; ');
+            const msg = `🛑 INVOICE ALERT \n\nVerdict: ${verdict}\nVendor: ${vendor}\nInvoice: ${invNo}\nTotal: ${currency} ${total}\n\nIssue: ${reason}\n\nDetails: ${problems}\n\nPlease advise before I collect payment.`;
+            return (
+              <div className="px-4 pb-4 border-t border-amber-200 dark:border-amber-800 space-y-3 pt-3">
+                <pre className="text-xs bg-white dark:bg-amber-950/20 border border-amber-200 rounded-xl p-3 whitespace-pre-wrap font-mono text-amber-900 dark:text-amber-200">{msg}</pre>
+                <div className="flex gap-2">
+                  <button
+                    className="flex-1 h-11 rounded-xl bg-green-600 text-white font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+                    onClick={() => {
+                      const encoded = encodeURIComponent(msg);
+                      window.open(`https://wa.me/?text=${encoded}`, '_blank');
+                    }}
+                  >
+                    <MessageCircle className="h-4 w-4" /> WhatsApp Manager
+                  </button>
+                  <button
+                    className="flex-1 h-11 rounded-xl border-2 border-amber-400 text-amber-700 dark:text-amber-300 font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+                    onClick={() => { navigator.clipboard.writeText(msg); toast({ title: 'Message copied ✓' }); }}
+                  >
+                    <Copy className="h-4 w-4" /> Copy
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -420,22 +613,30 @@ export const ResultsView = ({
         </div>
       )}
 
-      {/* ── PROTOCOL 9 VERDICT DETAILS (expandable) ── */}
+      {/* ── VERDICT DETAILS (expandable) ── */}
       {result.riskVerdict && result.riskVerdict.details.length > 0 && (
         <div className={cn('rounded-2xl border-2 overflow-hidden', verdictCfg.border)}>
           <div className={cn('px-4 py-3 border-b', verdictCfg.border)}>
             <p className={cn('font-bold text-sm flex items-center gap-2', verdictCfg.text)}>
               <VerdictIcon className="h-4 w-4" />
-              Why this verdict — detail for supervisor
+              Why this verdict — details &amp; how to fix
             </p>
           </div>
           <div className="p-3 space-y-2 bg-card">
-            {result.riskVerdict.details.map((d, i) => (
-              <div key={i} className="flex items-start gap-2 text-sm">
-                <XCircle className="h-4 w-4 text-red-500 flex-shrink-0 mt-0.5" />
-                <span className="leading-snug text-foreground/80">{d}</span>
-              </div>
-            ))}
+            {result.riskVerdict.details.map((d, i) => {
+              const isSuggestion = d.startsWith('→');
+              return (
+                <div key={i} className={cn('flex items-start gap-2 text-sm', isSuggestion ? 'pl-6' : '')}>
+                  {isSuggestion
+                    ? <Lightbulb className="h-4 w-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                    : <XCircle className="h-4 w-4 text-red-500 flex-shrink-0 mt-0.5" />
+                  }
+                  <span className={cn('leading-snug', isSuggestion ? 'text-amber-700 dark:text-amber-300 text-xs' : 'text-foreground/80')}>
+                    {isSuggestion ? d.replace(/^→\s*/, '') : d}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -674,7 +875,7 @@ export const ResultsView = ({
                 style={{ background: '#16a34a' }}
                 onClick={() => onApprove(result.id)}
               >
-                <ThumbsUp className="h-6 w-6" /> Approve — Collect
+                <ThumbsUp className="h-5 w-5" /> Approve — Collect
               </button>
               <button
                 className="action-btn-secondary flex-1 border-red-400 text-red-600"

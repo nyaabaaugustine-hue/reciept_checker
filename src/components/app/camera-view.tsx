@@ -14,10 +14,13 @@ export const CameraView = ({ onCapture, onOpenChange }: CameraViewProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const qualityCheckRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [flash, setFlash] = useState(false);
+  // #17 live quality coach
+  const [liveQuality, setLiveQuality] = useState<{ ok: boolean; label: string; colour: string } | null>(null);
   const { toast } = useToast();
 
   const startCamera = useCallback(async (facing: 'environment' | 'user') => {
@@ -50,6 +53,8 @@ export const CameraView = ({ onCapture, onOpenChange }: CameraViewProps) => {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play().catch(() => {/* autoplay policy — handled by playsInline */});
+        // Start live quality coach once video is playing
+        videoRef.current.onloadeddata = () => startQualityCoach();
       }
     } catch (error: any) {
       console.error('Camera error:', error);
@@ -66,12 +71,43 @@ export const CameraView = ({ onCapture, onOpenChange }: CameraViewProps) => {
     }
   }, [toast]);
 
+  // #17 — Live quality coach: sample the video every 600ms
+  const startQualityCoach = useCallback(() => {
+    if (qualityCheckRef.current) clearInterval(qualityCheckRef.current);
+    qualityCheckRef.current = setInterval(() => {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2) return;
+      const size = 64;
+      const tmpCanvas = document.createElement('canvas');
+      tmpCanvas.width = size; tmpCanvas.height = size;
+      const ctx = tmpCanvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(video, 0, 0, size, size);
+      const data = ctx.getImageData(0, 0, size, size).data;
+      let total = 0;
+      const samples = data.length / 4;
+      for (let i = 0; i < data.length; i += 4)
+        total += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+      const avg = total / samples;
+      let variance = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        const b = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+        variance += (b - avg) ** 2;
+      }
+      variance /= samples;
+      if (avg < 30)        setLiveQuality({ ok: false, label: '🌑 Too dark — move to better light', colour: '#ef4444' });
+      else if (variance < 80) setLiveQuality({ ok: false, label: '🌫️ Blurry — hold still', colour: '#f97316' });
+      else if (avg > 230)  setLiveQuality({ ok: false, label: '☀️ Too bright — reduce glare', colour: '#f97316' });
+      else                 setLiveQuality({ ok: true,  label: '✅ Good — tap to capture',  colour: '#22c55e' });
+    }, 600);
+  }, []);
+
   useEffect(() => {
     startCamera(facingMode);
-    // Lock body scroll while camera is open
     document.body.style.overflow = 'hidden';
     return () => {
       if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+      if (qualityCheckRef.current) clearInterval(qualityCheckRef.current);
       document.body.style.overflow = '';
     };
   }, []);// eslint-disable-line react-hooks/exhaustive-deps
@@ -279,17 +315,20 @@ export const CameraView = ({ onCapture, onOpenChange }: CameraViewProps) => {
         )}
       </div>
 
-      {/* ── HINT TEXT ── */}
+      {/* ── #17 LIVE QUALITY COACH ── */}
       {hasCameraPermission && (
         <div style={{
           textAlign: 'center',
-          color: 'rgba(255,255,255,0.65)',
           fontSize: 13,
-          padding: '8px 16px 4px',
-          background: 'rgba(0,0,0,0.6)',
+          fontWeight: 700,
+          padding: '8px 16px 6px',
+          background: 'rgba(0,0,0,0.7)',
           flexShrink: 0,
+          transition: 'color 0.3s',
+          color: liveQuality ? liveQuality.colour : 'rgba(255,255,255,0.65)',
+          letterSpacing: '0.01em',
         }}>
-          Align the invoice within the guide — hold steady
+          {liveQuality ? liveQuality.label : 'Align invoice within the guide — hold steady'}
         </div>
       )}
 
@@ -325,12 +364,12 @@ export const CameraView = ({ onCapture, onOpenChange }: CameraViewProps) => {
           <RotateCcw size={22} />
         </button>
 
-        {/* Shutter button */}
+        {/* Shutter button — #18: disabled when live quality is poor */}
         <button
           onClick={handleCapture}
-          disabled={!hasCameraPermission}
+          disabled={!hasCameraPermission || (liveQuality !== null && !liveQuality.ok)}
           style={{
-            background: hasCameraPermission ? '#2dd4bf' : '#555',
+            background: !hasCameraPermission ? '#555' : (liveQuality && !liveQuality.ok) ? '#555' : '#2dd4bf',
             border: '4px solid rgba(255,255,255,0.3)',
             borderRadius: '50%',
             width: 76,
@@ -338,10 +377,11 @@ export const CameraView = ({ onCapture, onOpenChange }: CameraViewProps) => {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            cursor: hasCameraPermission ? 'pointer' : 'not-allowed',
+            cursor: (hasCameraPermission && (!liveQuality || liveQuality.ok)) ? 'pointer' : 'not-allowed',
             color: '#000',
-            boxShadow: hasCameraPermission ? '0 0 0 6px rgba(45,212,191,0.25)' : 'none',
-            transition: 'all 0.15s',
+            boxShadow: (hasCameraPermission && (!liveQuality || liveQuality.ok)) ? '0 0 0 6px rgba(45,212,191,0.25)' : 'none',
+            transition: 'all 0.2s',
+            opacity: (liveQuality && !liveQuality.ok) ? 0.5 : 1,
           }}
           aria-label="Capture photo"
         >

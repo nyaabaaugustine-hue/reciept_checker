@@ -24,17 +24,7 @@ import { Camera, Upload, History, LayoutDashboard, X } from 'lucide-react';
 
 type ViewState = 'dashboard' | 'processing' | 'results';
 
-// ── fix #8: speak verdict aloud using Web Speech API ──
-function speakVerdict(verdict: string, reason: string) {
-  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
-  window.speechSynthesis.cancel();
-  const msg = new SpeechSynthesisUtterance(`${verdict}. ${reason}`);
-  msg.rate = 0.95;
-  msg.volume = 1;
-  window.speechSynthesis.speak(msg);
-}
-
-// ── fix #2: strip ocrText before sending history to server ──
+// ── strip ocrText before sending history to server ──
 function slimHistory(history: InvoiceProcessingResult[]): SlimInvoiceResult[] {
   return history.map(({ ocrText: _ocr, ...rest }) => rest);
 }
@@ -77,10 +67,11 @@ export default function HomePage() {
   const pinRequired = settings.pinEnabled && settings.pinHash && !isUnlocked;
 
   useEffect(() => {
+    if (sessionStorage.getItem('pwa-dismissed')) return;
     const handler = (e: any) => { e.preventDefault(); setDeferredPrompt(e); setShowInstallPrompt(true); };
     window.addEventListener('beforeinstallprompt', handler);
     return () => window.removeEventListener('beforeinstallprompt', handler);
-  }, []);
+  }, []); 
 
   const handleInstall = async () => {
     if (!deferredPrompt) return;
@@ -160,7 +151,6 @@ export default function HomePage() {
     setProcessingStatus('Reading invoice with AI — this may take a moment…');
     let result: InvoiceProcessingResult;
     try {
-      // fix #2: pass slim history (no ocrText) to keep server action payload small
       result = await processInvoice(optimised, settings.taxRatePct, slimHistory(history));
     } catch (error: any) {
       const raw: string = error?.message ?? '';
@@ -172,28 +162,25 @@ export default function HomePage() {
     }
 
     setProcessingStatus('Finalising analysis…');
-    // fix #4: do NOT overwrite server-computed healthScore here
 
-    // ── Verdict toast + fix #8: voice feedback ──
+    // ── Verdict toast ──
     const verdict = result.riskVerdict;
     if (verdict) {
       const isUrgent = verdict.verdict === 'REJECT' || verdict.verdict === 'ESCALATE';
       if (verdict.verdict === 'REJECT') {
         toast({ variant: 'destructive', title: '🔴 REJECT — Do NOT collect money', description: verdict.reason, duration: 15000 });
       } else if (verdict.verdict === 'ESCALATE') {
-        toast({ variant: 'destructive', title: '🟠 ESCALATE — Call your manager', description: verdict.reason, duration: 15000 });
+        toast({ variant: 'destructive', title: '🟠 ESCALATE — Check this invoice carefully', description: verdict.reason, duration: 15000 });
       } else if (verdict.verdict === 'CAUTION') {
         toast({ title: '🟡 CAUTION — Review before collecting', description: verdict.reason, duration: 10000 });
       } else {
         toast({ title: '🟢 ACCEPT — Safe to collect', description: verdict.reason, duration: 8000 });
       }
-      // Speak verdict — especially useful in noisy environments or bright sunlight
-      speakVerdict(verdict.verdict, verdict.reason);
-      // Extra haptic pulse for urgent verdicts
+      // Haptic pulse for urgent verdicts
       if (isUrgent && 'vibrate' in navigator) navigator.vibrate([100, 50, 100, 50, 200]);
     }
 
-    // Secondary toasts (only if not already covered by verdict)
+    // Secondary toasts
     if (result.isDuplicate && verdict?.verdict !== 'REJECT') {
       toast({ variant: 'destructive', title: '⚠️ Duplicate Invoice', description: 'Already scanned. Do NOT collect money again.', duration: 12000 });
     }
@@ -201,7 +188,6 @@ export default function HomePage() {
       toast({ variant: 'destructive', title: '💰 Partial Payment', description: `Original total was ${result.partialPaymentOriginalTotal.toFixed(2)}. Verify with manager.`, duration: 12000 });
     }
     if (result.priceWarnings?.length && verdict?.verdict === 'ACCEPT') {
-      // Only show separately when verdict didn't already convey price issue
       toast({ title: '📈 Price Change', description: result.priceWarnings[0], duration: 10000 });
     }
     if (result.reconciliationApplied) {
@@ -373,40 +359,45 @@ export default function HomePage() {
         {view !== 'processing' && (
           <div className="bottom-bar no-print">
             {view === 'results' ? (
-              <button className="action-btn-secondary flex-1" onClick={handleReset}>
-                <LayoutDashboard className="h-5 w-5" /> Dashboard
+              <button className="action-btn-secondary flex-1 min-w-0" onClick={handleReset}>
+                <LayoutDashboard className="h-4 w-4 flex-shrink-0" />
+                <span className="truncate text-sm">Home</span>
               </button>
             ) : null}
-            <button className="action-btn-secondary flex-1" onClick={handleHistoryToggle}>
-              <History className="h-5 w-5" />
-              History {mounted && history.length > 0 && (
-                <span className="ml-1 bg-primary text-primary-foreground text-xs rounded-full px-2 py-0.5">
-                  {history.length}
-                </span>
-              )}
+            <button className="action-btn-secondary flex-1 min-w-0" onClick={handleHistoryToggle}>
+              <History className="h-4 w-4 flex-shrink-0" />
+              <span className="truncate text-sm">
+                History{mounted && history.length > 0 && (
+                  <span className="ml-1 bg-primary text-primary-foreground text-xs rounded-full px-1.5 py-0.5">
+                    {history.length}
+                  </span>
+                )}
+              </span>
             </button>
-            <button className="action-btn-secondary flex-1" onClick={() => fileInputRef.current?.click()}>
-              <Upload className="h-5 w-5" /> Upload
+            <button className="action-btn-secondary flex-1 min-w-0" onClick={() => fileInputRef.current?.click()}>
+              <Upload className="h-4 w-4 flex-shrink-0" />
+              <span className="truncate text-sm">Upload</span>
             </button>
-            <button className="action-btn-primary flex-1" onClick={() => setIsCameraOpen(true)}>
-              <Camera className="h-5 w-5" /> Scan
+            <button className="action-btn-primary flex-1 min-w-0" onClick={() => setIsCameraOpen(true)}>
+              <Camera className="h-4 w-4 flex-shrink-0" />
+              <span className="truncate text-sm">Scan</span>
             </button>
           </div>
         )}
 
         {showInstallPrompt && (
           <div className="pwa-banner no-print">
-            <div className="flex-1">
-              <p className="font-bold text-sm">Add to Home Screen</p>
-              <p className="text-xs opacity-80">Use InvoiceGuard like a native app — works offline too</p>
+            <div className="flex-1 min-w-0">
+              <p className="font-bold text-sm truncate">Add to Home Screen</p>
+              <p className="text-xs opacity-80 truncate">Use InvoiceGuard like a native app</p>
             </div>
             <button
-              className="bg-white text-primary font-bold px-4 py-2 rounded-xl text-sm active:scale-95"
+              className="bg-white text-primary font-bold px-3 py-2 rounded-xl text-sm active:scale-95 flex-shrink-0"
               onClick={handleInstall}
             >
               Install
             </button>
-            <button className="opacity-60 p-2" onClick={() => setShowInstallPrompt(false)}>
+            <button className="opacity-60 p-2 flex-shrink-0" onClick={() => { sessionStorage.setItem('pwa-dismissed', '1'); setShowInstallPrompt(false); }}>
               <X className="h-4 w-4" />
             </button>
           </div>
