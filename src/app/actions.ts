@@ -9,6 +9,10 @@ import {
   calcHealthScore,
 } from '@/lib/invoice-intelligence';
 
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+
 function parseNumber(value: any): number | undefined {
   if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) return undefined;
   const cleaned = String(value).replace(/[^0-9.-]/g, '');
@@ -16,17 +20,127 @@ function parseNumber(value: any): number | undefined {
   return isNaN(parsed) ? undefined : parsed;
 }
 
-export async function processInvoice(imageBase64: string): Promise<InvoiceProcessingResult> {
-  let aiExtractedData;
+function getGroqApiKey(): string {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new Error('GROQ_API_KEY is not configured. Add it to your .env.local file and redeploy.');
+  return key;
+}
+
+// Exponential backoff — retries on 429 / 5xx only
+async function fetchWithRetry(url: string, options: RequestInit, retries = 3): Promise<Response> {
+  let lastError: Error = new Error('Network error');
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status === 429 || res.status >= 500) {
+        lastError = new Error(`HTTP ${res.status} on attempt ${attempt + 1}`);
+        await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+        continue;
+      }
+      return res;
+    } catch (err: any) {
+      lastError = err;
+      await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+    }
+  }
+  throw lastError;
+}
+
+// ─────────────────────────────────────────────────────────────
+// GROQ VISION  — tries each model in order
+// ─────────────────────────────────────────────────────────────
+
+const GROQ_MODELS = [
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'llama-3.2-90b-vision-preview',
+  'llama-3.2-11b-vision-preview',
+];
+
+async function callGroqVision(imageUrl: string, prompt: string, apiKey: string): Promise<string> {
+  let lastError: Error = new Error('All Groq vision models failed');
+
+  for (const model of GROQ_MODELS) {
+    try {
+      console.log(`[Groq] Trying model: ${model}`);
+      const response = await fetchWithRetry(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: 2000,
+            temperature: 0.1,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: imageUrl } },
+                { type: 'text', text: prompt },
+              ],
+            }],
+          }),
+        },
+        3
+      );
+
+      if (!response.ok) {
+        const body = await response.text();
+        if (response.status === 400 || response.status === 404) {
+          lastError = new Error(`Groq model ${model} unavailable (${response.status})`);
+          console.warn(`[Groq] ${lastError.message} — trying next model`);
+          continue;
+        }
+        throw new Error(`Groq API error ${response.status}: ${body.slice(0, 300)}`);
+      }
+
+      const completion = await response.json();
+      const content: string | undefined = completion.choices?.[0]?.message?.content;
+      if (!content) throw new Error('Groq returned an empty response.');
+
+      console.log(`[Groq] Success with model: ${model}`);
+      return content;
+
+    } catch (err: any) {
+      if (
+        err.message?.includes('unavailable') ||
+        err.message?.includes('404') ||
+        err.message?.includes('400')
+      ) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError;
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN SERVER ACTION
+// ─────────────────────────────────────────────────────────────
+
+export async function processInvoice(
+  imageBase64: string,
+  taxRatePct: number = 15
+): Promise<InvoiceProcessingResult> {
+  let aiExtractedData: any;
 
   try {
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) throw new Error('GROQ_API_KEY is not set in .env.local');
+    const groqApiKey = getGroqApiKey();
 
     const matches = imageBase64.match(/^data:(.+);base64,(.+)$/);
     if (!matches) throw new Error('Invalid image format. Expected a base64 data URI.');
     const mediaType = matches[1];
     const rawBase64 = matches[2];
+
+    if (rawBase64.length > 11_000_000) {
+      throw new Error('Image is too large (max ~8MB). Please use a lower resolution and try again.');
+    }
+
     const imageUrl = `data:${mediaType};base64,${rawBase64}`;
 
     const prompt = `You are an expert accountant and data entry specialist with exceptional OCR ability.
@@ -57,41 +171,19 @@ Respond ONLY with a single valid JSON object — no markdown, no preamble, no ex
 
 Extract every visible line item. Numbers like 1,234.56 become 1234.56.`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens: 2000,
-        temperature: 0.1,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image_url', image_url: { url: imageUrl } },
-            { type: 'text', text: prompt },
-          ],
-        }],
-      }),
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`Groq API error (Status: ${response.status}). Body: ${errorBody}`);
-    }
-
-    const completion = await response.json();
-    let rawJson = completion.choices?.[0]?.message?.content;
-    if (!rawJson) throw new Error('Groq returned an empty response.');
-
-    rawJson = rawJson.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+    const rawJson = await callGroqVision(imageUrl, prompt, groqApiKey);
+    const cleaned = rawJson
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
 
     try {
-      aiExtractedData = JSON.parse(rawJson);
+      aiExtractedData = JSON.parse(cleaned);
     } catch {
-      throw new Error(`Groq returned invalid JSON. Raw: ${rawJson}`);
+      throw new Error(`AI returned invalid JSON. Raw: ${cleaned.slice(0, 300)}`);
     }
 
-    // ── Build validated data ──────────────────────────────────────────────────
     const validatedData: ValidatedData = {
       invoice_number: aiExtractedData.invoice_number || undefined,
       date: aiExtractedData.date || undefined,
@@ -110,13 +202,11 @@ Extract every visible line item. Numbers like 1,234.56 become 1234.56.`;
 
     const errors: ValidationError[] = [];
 
-    // Core field checks
     if (!validatedData.invoice_number) errors.push({ field: 'invoice_number', message: 'Invoice number is missing or unreadable.' });
     if (!validatedData.customer_name) errors.push({ field: 'customer_name', message: 'Customer name is missing or unreadable.' });
     if (validatedData.total === undefined) errors.push({ field: 'total', message: 'Grand total is missing or unreadable.' });
     if (!validatedData.items || validatedData.items.length === 0) errors.push({ field: 'items', message: 'No line items were found on the invoice.' });
 
-    // Line item maths
     let calculatedSubtotal = 0;
     for (const [i, item] of (validatedData.items || []).entries()) {
       const qty = item.quantity ?? 0;
@@ -134,7 +224,6 @@ Extract every visible line item. Numbers like 1,234.56 become 1234.56.`;
       }
     }
 
-    // Subtotal check
     if (validatedData.subtotal !== undefined && Math.abs(calculatedSubtotal - validatedData.subtotal) > 0.01) {
       errors.push({
         field: 'subtotal',
@@ -142,8 +231,11 @@ Extract every visible line item. Numbers like 1,234.56 become 1234.56.`;
       });
     }
 
-    // Grand total check
-    if (validatedData.subtotal !== undefined && validatedData.tax !== undefined && validatedData.total !== undefined) {
+    if (
+      validatedData.subtotal !== undefined &&
+      validatedData.tax !== undefined &&
+      validatedData.total !== undefined
+    ) {
       const expected = validatedData.subtotal + validatedData.tax;
       if (Math.abs(expected - validatedData.total) > 0.01) {
         errors.push({
@@ -153,13 +245,11 @@ Extract every visible line item. Numbers like 1,234.56 become 1234.56.`;
       }
     }
 
-    // #5 Tax rate check
-    const taxCheck = validateTaxRate(validatedData.subtotal, validatedData.tax);
+    const taxCheck = validateTaxRate(validatedData.subtotal, validatedData.tax, taxRatePct);
     if (!taxCheck.ok && taxCheck.message) {
       errors.push({ field: 'tax', message: taxCheck.message });
     }
 
-    // #10 Date anomaly
     const dateWarning = checkDateAnomaly(validatedData.date);
     if (dateWarning) {
       errors.push({ field: 'date', message: dateWarning });
@@ -168,26 +258,29 @@ Extract every visible line item. Numbers like 1,234.56 become 1234.56.`;
     const isValid = errors.length === 0;
     const status = isValid ? 'verified' : 'error';
 
-    // Build partial result (duplicate/recurring enrichment happens client-side with history context)
     const partialResult: InvoiceProcessingResult = {
       id: crypto.randomUUID(),
       isValid,
       errors,
       validatedData,
-      ocrText: `[Groq Vision AI — Llama 4 Scout${aiExtractedData.currency ? ` | ${aiExtractedData.currency}` : ''}]${aiExtractedData.ocr_notes ? `\nNotes: ${aiExtractedData.ocr_notes}` : ''}\n\n${JSON.stringify(aiExtractedData, null, 2)}`,
+      ocrText: `[Groq Vision AI${aiExtractedData.currency ? ` | ${aiExtractedData.currency}` : ''}]${aiExtractedData.ocr_notes ? `\nNotes: ${aiExtractedData.ocr_notes}` : ''}\n\n${JSON.stringify(aiExtractedData, null, 2)}`,
       status,
       createdAt: new Date().toISOString(),
       dueDate: aiExtractedData.due_date || undefined,
       vendorKey: normaliseVendorKey(validatedData.customer_name),
       smartName: buildSmartName(validatedData),
+      currency: aiExtractedData.currency || undefined,
     };
 
-    // Health score (no duplicate info yet — will be recalculated client-side)
     partialResult.healthScore = calcHealthScore(partialResult);
-
     return partialResult;
+
   } catch (error: any) {
+    const msg: string =
+      typeof error?.message === 'string' && error.message.length < 500
+        ? error.message
+        : 'Unknown server error';
     console.error('--- processInvoice error ---', error);
-    throw new Error(`Invoice processing failed: ${error.message || 'Unknown error'}`);
+    throw new Error(`Invoice processing failed: ${msg}`);
   }
 }

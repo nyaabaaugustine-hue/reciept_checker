@@ -32,7 +32,30 @@ export function detectDuplicate(
   return { isDuplicate: false };
 }
 
-// #5 — salesman language: "receiving money" not "paying"
+// #30 — detect partial payment: same invoice number, lower total
+export function detectPartialPayment(
+  result: InvoiceProcessingResult,
+  history: InvoiceProcessingResult[]
+): { isPartial: boolean; originalTotal?: number; originalId?: string } {
+  const invNo = result.validatedData.invoice_number;
+  const total = result.validatedData.total;
+  if (!invNo || total === undefined) return { isPartial: false };
+  const vendorKey = normaliseVendorKey(result.validatedData.customer_name);
+  for (const h of history) {
+    if (h.id === result.id) continue;
+    const hVendorKey = normaliseVendorKey(h.validatedData.customer_name);
+    if (
+      h.validatedData.invoice_number === invNo &&
+      hVendorKey === vendorKey &&
+      h.validatedData.total !== undefined &&
+      total < h.validatedData.total
+    ) {
+      return { isPartial: true, originalTotal: h.validatedData.total, originalId: h.id };
+    }
+  }
+  return { isPartial: false };
+}
+
 export function validateTaxRate(
   subtotal: number | undefined,
   tax: number | undefined,
@@ -132,6 +155,22 @@ export function calcHealthScore(result: InvoiceProcessingResult): number {
   score -= Math.min(result.errors.length * 10, 30);
   if (result.isDuplicate) score -= 25;
   return Math.max(0, score);
+}
+
+// #27 — health score breakdown for display
+export function healthScoreBreakdown(result: InvoiceProcessingResult): Array<{ label: string; deduction: number; ok: boolean }> {
+  const d = result.validatedData;
+  return [
+    { label: 'Invoice number present', deduction: 15, ok: !!d.invoice_number },
+    { label: 'Customer name present', deduction: 15, ok: !!d.customer_name },
+    { label: 'Invoice date present', deduction: 10, ok: !!d.date },
+    { label: 'Grand total readable', deduction: 20, ok: d.total !== undefined },
+    { label: 'Line items found', deduction: 20, ok: !!(d.items && d.items.length > 0) },
+    { label: 'Subtotal present', deduction: 5, ok: d.subtotal !== undefined },
+    { label: 'Tax present', deduction: 5, ok: d.tax !== undefined },
+    { label: 'No validation errors', deduction: Math.min(result.errors.length * 10, 30), ok: result.errors.length === 0 },
+    { label: 'Not a duplicate', deduction: 25, ok: !result.isDuplicate },
+  ];
 }
 
 export function healthLabel(score: number): { label: string; colour: string } {
@@ -269,4 +308,68 @@ export function buildDailyReportData(history: InvoiceProcessingResult[]) {
     moneySafe: approvedInvoices.reduce((s, i) => s + (i.validatedData.total || 0), 0),
     invoices: todayInvoices,
   };
+}
+
+// #36 — check if money-at-risk exceeds user threshold
+export function checkRiskThreshold(history: InvoiceProcessingResult[], thresholdStr: string): { exceeded: boolean; atRisk: number; threshold: number } {
+  const threshold = parseFloat(thresholdStr) || 0;
+  if (threshold <= 0) return { exceeded: false, atRisk: 0, threshold };
+  const atRisk = history
+    .filter(i => i.status === 'error')
+    .reduce((s, i) => s + (i.validatedData.total || 0), 0);
+  return { exceeded: atRisk > threshold, atRisk, threshold };
+}
+
+// #1 Image preprocessing: resize + adjust contrast before sending to AI
+export async function preprocessImage(dataUri: string, maxWidth = 1600): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const scale = Math.min(1, maxWidth / img.width);
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d')!;
+      // Slight contrast boost helps OCR
+      ctx.filter = 'contrast(1.1) brightness(1.05)';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.88));
+    };
+    img.onerror = () => resolve(dataUri); // fallback: use original
+    img.src = dataUri;
+  });
+}
+
+// #3 — image quality gate: check if image is too dark or too blurry
+export function checkImageQuality(dataUri: string): Promise<{ ok: boolean; reason?: string }> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      // Sample a small region for speed
+      canvas.width = 64;
+      canvas.height = 64;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0, 64, 64);
+      const data = ctx.getImageData(0, 0, 64, 64).data;
+      let total = 0;
+      let variance = 0;
+      const samples = data.length / 4;
+      for (let i = 0; i < data.length; i += 4) {
+        const brightness = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
+        total += brightness;
+      }
+      const avg = total / samples;
+      for (let i = 0; i < data.length; i += 4) {
+        const brightness = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
+        variance += (brightness - avg) ** 2;
+      }
+      variance /= samples;
+      if (avg < 30) return resolve({ ok: false, reason: 'Image is too dark. Move to better lighting and retake.' });
+      if (variance < 80) return resolve({ ok: false, reason: 'Image appears blurry or blank. Hold the camera steady and retake.' });
+      resolve({ ok: true });
+    };
+    img.onerror = () => resolve({ ok: true }); // don't block on error
+    img.src = dataUri;
+  });
 }

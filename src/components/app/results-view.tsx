@@ -5,6 +5,8 @@ import type { InvoiceProcessingResult, ValidatedData } from '@/lib/types';
 import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
 import { calcHealthScore, healthLabel, daysUntilDue, dueDateStatus } from '@/lib/invoice-intelligence';
+import { shareViaWhatsApp, shareNative } from '@/lib/utils';
+import { HealthScoreBadge } from './health-score-badge';
 
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -15,6 +17,7 @@ import {
   BookOpen, AlertTriangle, ShieldAlert, BadgeCheck,
   ThumbsUp, ThumbsDown, CalendarClock, StickyNote,
   RefreshCw, AlertOctagon, ChevronDown, ChevronUp,
+  Share2, MessageCircle, Calculator,
 } from 'lucide-react';
 import { ExportMenu } from './export-menu';
 
@@ -26,6 +29,7 @@ interface ResultsViewProps {
   onDueDateUpdate: (id: string, dueDate: string) => void;
   onApprove: (id: string) => void;
   onReject: (id: string, reason: string) => void;
+  currency?: string;
 }
 
 function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors'], isValid: boolean) {
@@ -83,7 +87,7 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
 }
 
 export const ResultsView = ({
-  result, onReset, onUpdate, onNotesUpdate, onDueDateUpdate, onApprove, onReject,
+  result, onReset, onUpdate, onNotesUpdate, onDueDateUpdate, onApprove, onReject, currency = 'GHS',
 }: ResultsViewProps) => {
   const { toast } = useToast();
   const [editedData, setEditedData] = useState<ValidatedData>(JSON.parse(JSON.stringify(result.validatedData)));
@@ -117,6 +121,15 @@ export const ResultsView = ({
   const story = useMemo(() => buildStory(editedData, result.errors, result.isValid), [editedData, result.errors, result.isValid]);
   const health = healthLabel(result.healthScore ?? calcHealthScore(result));
   const dueDays = daysUntilDue(dueDate || result.dueDate);
+
+  // #22 — suggested correct total when mismatch detected
+  const suggestedTotal = useMemo(() => {
+    const sub = editedData.subtotal;
+    const tax = editedData.tax;
+    if (sub !== undefined && tax !== undefined) return sub + tax;
+    const itemSum = (editedData.items || []).reduce((s, i) => s + (i.line_total || 0), 0);
+    return itemSum || undefined;
+  }, [editedData]);
   const dueStatus = dueDateStatus(dueDays);
   const fmt = (n: number) => n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -205,6 +218,25 @@ export const ResultsView = ({
         </div>
       </div>
 
+      {/* ── HEALTH SCORE BREAKDOWN BADGE (#27) ── */}
+      <div className="flex flex-wrap gap-2">
+        <HealthScoreBadge result={result} />
+      </div>
+
+      {/* ── PARTIAL PAYMENT ALERT (#30) ── */}
+      {result.isPartialPayment && result.partialPaymentOriginalTotal !== undefined && (
+        <div className="rounded-2xl border-2 border-yellow-400 bg-yellow-50 dark:bg-yellow-950/30 p-4 flex items-start gap-3">
+          <Calculator className="h-6 w-6 text-yellow-600 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="font-black text-yellow-700 dark:text-yellow-400 text-base">Possible Partial Payment</p>
+            <p className="text-sm text-yellow-700 dark:text-yellow-300 mt-1">
+              Same invoice number exists with a higher total of {fmt(result.partialPaymentOriginalTotal)}.
+              Verify with customer whether this is a partial payment.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* ── DUPLICATE ALERT ── */}
       {result.isDuplicate && (
         <div className="rounded-2xl border-2 border-red-500 bg-red-50 dark:bg-red-950/40 p-4 flex items-start gap-3">
@@ -213,6 +245,17 @@ export const ResultsView = ({
             <p className="font-black text-red-700 dark:text-red-400 text-base">Duplicate Invoice!</p>
             <p className="text-sm text-red-600 dark:text-red-300 mt-1">This invoice matches one already in your history. Do NOT collect payment twice — contact the customer immediately.</p>
           </div>
+        </div>
+      )}
+
+      {/* ── SUGGESTED CORRECT TOTAL (#22) ── */}
+      {!result.isValid && suggestedTotal !== undefined && editedData.total !== undefined && Math.abs(suggestedTotal - editedData.total) > 0.01 && (
+        <div className="rounded-2xl border-2 border-blue-300 bg-blue-50 dark:bg-blue-950/30 p-4 flex items-center justify-between gap-3">
+          <div>
+            <p className="font-bold text-blue-700 dark:text-blue-400 text-sm">Suggested Correct Total</p>
+            <p className="text-xs text-blue-600 dark:text-blue-300 mt-0.5">Based on subtotal + tax from this invoice</p>
+          </div>
+          <span className="text-2xl font-black text-blue-700 dark:text-blue-300">{fmt(suggestedTotal)}</span>
         </div>
       )}
 
@@ -410,6 +453,28 @@ export const ResultsView = ({
             </div>
           </div>
         )}
+      </div>
+
+      {/* ── SHARE BUTTONS (#39–#41) ── */}
+      <div className="rounded-2xl border bg-card p-4 space-y-2">
+        <p className="font-semibold text-sm flex items-center gap-2"><Share2 className="h-4 w-4 text-primary" /> Share This Invoice</p>
+        <div className="flex gap-2">
+          <button
+            onClick={() => shareViaWhatsApp(result, currency)}
+            className="flex-1 h-11 rounded-xl border-2 border-green-500 text-green-700 dark:text-green-400 font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+          >
+            <MessageCircle className="h-4 w-4" /> WhatsApp
+          </button>
+          <button
+            onClick={async () => {
+              const usedNative = await shareNative(result, currency);
+              toast({ title: usedNative ? 'Shared!' : 'Copied to clipboard ✓' });
+            }}
+            className="flex-1 h-11 rounded-xl border-2 border-border font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+          >
+            <Share2 className="h-4 w-4" /> Share / Copy
+          </button>
+        </div>
       </div>
 
       {/* ── AI LOG (collapsible) ── */}

@@ -1,6 +1,6 @@
 'use client';
 
-import { ShieldCheck, WifiOff } from 'lucide-react';
+import { ShieldCheck, WifiOff, Settings } from 'lucide-react';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { Badge } from '@/components/ui/badge';
 
@@ -9,9 +9,14 @@ interface AppHeaderProps {
   offlineQueueCount?: number;
   onHistoryToggle?: () => void;
   historyCount?: number;
+  onSettingsOpen?: () => void;
 }
 
-export const AppHeader = ({ isOnline = true, offlineQueueCount = 0 }: AppHeaderProps) => (
+export const AppHeader = ({
+  isOnline = true,
+  offlineQueueCount = 0,
+  onSettingsOpen,
+}: AppHeaderProps) => (
   <header className="sticky top-0 z-30 border-b bg-card/95 backdrop-blur no-print pt-safe" role="banner">
     <div className="container mx-auto px-3 max-w-2xl lg:max-w-6xl flex items-center justify-between gap-2" style={{ minHeight: 56 }}>
       <div className="flex items-center gap-2">
@@ -31,6 +36,15 @@ export const AppHeader = ({ isOnline = true, offlineQueueCount = 0 }: AppHeaderP
           </Badge>
         ) : null}
         <ThemeToggle />
+        {onSettingsOpen && (
+          <button
+            onClick={onSettingsOpen}
+            className="w-10 h-10 flex items-center justify-center rounded-full bg-muted active:scale-95 transition-transform"
+            aria-label="Open settings"
+          >
+            <Settings className="h-5 w-5 text-muted-foreground" />
+          </button>
+        )}
       </div>
     </div>
   </header>

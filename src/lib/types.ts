@@ -29,29 +29,26 @@ export type InvoiceProcessingResult = {
   ocrText: string;
   status: InvoiceStatus;
   createdAt: string;
-  // #27 quick notes
   notes?: string;
-  // #25 payment due date
   dueDate?: string;
-  // approval / rejection
   approvedAt?: string;
   rejectedAt?: string;
   rejectionReason?: string;
-  // #1 duplicate detection
   isDuplicate?: boolean;
   duplicateOfId?: string;
-  // #4 vendor consistency
   vendorKey?: string;
-  // #39 smart name
   smartName?: string;
-  // #40 recurring flag
   isRecurring?: boolean;
-  recurringDelta?: number; // % change vs last seen from same vendor
-  // #43 health score
+  recurringDelta?: number;
   healthScore?: number;
+  // #30 partial payment detection
+  isPartialPayment?: boolean;
+  partialPaymentOriginalTotal?: number;
+  partialPaymentOriginalId?: string;
+  // currency extracted by AI
+  currency?: string;
 };
 
-// #40 recurring pattern tracker
 export interface VendorProfile {
   vendorKey: string;
   vendorName: string;
@@ -60,8 +57,29 @@ export interface VendorProfile {
   lastTotal: number;
   lastSeen: string;
   categories: string[];
-  itemNames: string[];           // price memory: known items
-  itemPrices: Record<string, number>; // item name -> last unit_price
+  itemNames: string[];
+  itemPrices: Record<string, number>;
   errorCount: number;
-  taxRates: number[];            // #5 tax rate history
+  taxRates: number[];
 }
+
+// #44 / #45 / #46 / #47 / #50 — user settings
+export interface AppSettings {
+  salesmanName: string;
+  currency: string;           // e.g. 'GHS', 'USD', 'NGN'
+  taxRatePct: number;         // e.g. 15
+  riskThreshold: string;      // money-at-risk alert threshold
+  customCategories: string[]; // extra categories beyond AI defaults
+  pinEnabled: boolean;
+  pinHash: string;            // SHA-256 of PIN (hex string)
+}
+
+export const DEFAULT_SETTINGS: AppSettings = {
+  salesmanName: '',
+  currency: 'GHS',
+  taxRatePct: 15,
+  riskThreshold: '',
+  customCategories: [],
+  pinEnabled: false,
+  pinHash: '',
+};
