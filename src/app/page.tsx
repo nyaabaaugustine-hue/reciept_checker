@@ -20,7 +20,11 @@ import {
   checkRiskThreshold,
 } from '@/lib/invoice-intelligence';
 import { exportAllHistory, importHistory } from '@/lib/utils';
-import { Camera, Upload, History, LayoutDashboard, X } from 'lucide-react';
+import { Camera, Upload, History, LayoutDashboard, X, Plus } from 'lucide-react';
+import { NewInvoiceChooser } from '@/components/app/new-invoice-chooser';
+import { ManualInvoiceModal } from '@/components/app/manual-invoice-modal';
+import { VoiceInvoiceModal } from '@/components/app/voice-invoice-modal';
+import { AIHelpModal, buildHelpFields, shouldShowHelpModal } from '@/components/app/ai-help-modal';
 
 type ViewState = 'dashboard' | 'processing' | 'results';
 
@@ -59,6 +63,11 @@ export default function HomePage() {
   const [showInstallPrompt, setShowInstallPrompt] = useState(false);
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showNewInvoiceChooser, setShowNewInvoiceChooser] = useState(false);
+  const [showManualModal, setShowManualModal] = useState(false);
+  const [showVoiceModal, setShowVoiceModal] = useState(false);
+  const [helpModalResult, setHelpModalResult] = useState<InvoiceProcessingResult | null>(null);
+  const [lastImageUri, setLastImageUri] = useState<string>('');
   const [isUnlocked, setIsUnlocked] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wakeLockRef = useRef<any>(null);
@@ -145,10 +154,11 @@ export default function HomePage() {
       return null;
     }
 
+    setLastImageUri(imageUri);
     setProcessingStatus('Optimising image…');
     const optimised = await preprocessImage(imageUri);
 
-    setProcessingStatus('Reading invoice with AI — this may take a moment…');
+    setProcessingStatus('Verifying this is an invoice…');
     let result: InvoiceProcessingResult;
     try {
       result = await processInvoice(optimised, settings.taxRatePct, slimHistory(history));
@@ -162,6 +172,14 @@ export default function HomePage() {
     }
 
     setProcessingStatus('Finalising analysis…');
+
+    // ── Ask for human help if AI couldn't read critical fields ──
+    if (shouldShowHelpModal(result.validatedData, result.errors)) {
+      setHelpModalResult(result);
+      setView('results'); // show results in bg
+      setActiveResult(result);
+      return result;
+    }
 
     // ── Verdict toast ──
     const verdict = result.riskVerdict;
@@ -261,6 +279,74 @@ export default function HomePage() {
   };
   const handleClearHistory = () => { setHistory([]); handleReset(); };
 
+  const handleHelpSubmit = (filled: Record<string, string>) => {
+    if (!helpModalResult) return;
+    const updated: InvoiceProcessingResult = {
+      ...helpModalResult,
+      validatedData: {
+        ...helpModalResult.validatedData,
+        ...(filled.total ? { total: parseFloat(filled.total) } : {}),
+        ...(filled.invoice_number ? { invoice_number: filled.invoice_number } : {}),
+        ...(filled.customer_name ? { customer_name: filled.customer_name } : {}),
+        ...(filled.date ? { date: filled.date } : {}),
+      },
+    };
+    // Remove errors for fields the user just filled
+    updated.errors = updated.errors.filter(e => {
+      if (filled.total && (e.field === 'total' || e.message.includes('Grand total'))) return false;
+      if (filled.invoice_number && e.field === 'invoice_number') return false;
+      if (filled.customer_name && e.field === 'customer_name') return false;
+      if (filled.date && e.field === 'date') return false;
+      return true;
+    });
+    updated.isValid = updated.errors.length === 0;
+    setHistory(prev => [updated, ...prev.filter(i => i.id !== updated.id)]);
+    setActiveResult(updated);
+    setHelpModalResult(null);
+    finishInvoice(updated);
+  };
+
+  const handleHelpSkip = () => {
+    if (!helpModalResult) return;
+    setHistory(prev => [helpModalResult, ...prev.filter(i => i.id !== helpModalResult.id)]);
+    setHelpModalResult(null);
+    finishInvoice(helpModalResult);
+  };
+
+  const finishInvoice = (result: InvoiceProcessingResult) => {
+    setProcessingStatus(null);
+    const verdict = result.riskVerdict;
+    if (verdict) {
+      const isUrgent = verdict.verdict === 'REJECT' || verdict.verdict === 'ESCALATE';
+      if (verdict.verdict === 'REJECT') {
+        toast({ variant: 'destructive', title: '🔴 REJECT — Do NOT collect money', description: verdict.reason, duration: 15000 });
+      } else if (verdict.verdict === 'ESCALATE') {
+        toast({ variant: 'destructive', title: '🟠 ESCALATE — Check this invoice carefully', description: verdict.reason, duration: 15000 });
+      } else if (verdict.verdict === 'CAUTION') {
+        toast({ title: '🟡 CAUTION — Review before collecting', description: verdict.reason, duration: 10000 });
+      } else {
+        toast({ title: '🟢 ACCEPT — Safe to collect', description: verdict.reason, duration: 8000 });
+      }
+      if (isUrgent && 'vibrate' in navigator) navigator.vibrate([100, 50, 100, 50, 200]);
+    }
+  };
+
+  const handleManualInvoiceSubmit = (result: InvoiceProcessingResult) => {
+    setShowManualModal(false);
+    setHistory(prev => [result, ...prev]);
+    setActiveResult(result);
+    setView('results');
+    toast({ title: '✅ Invoice Created', description: `Manual invoice saved for ${result.validatedData.customer_name || 'customer'}.` });
+  };
+
+  const handleVoiceInvoiceSubmit = (result: InvoiceProcessingResult) => {
+    setShowVoiceModal(false);
+    setHistory(prev => [result, ...prev]);
+    setActiveResult(result);
+    setView('results');
+    toast({ title: '🎙️ Voice Invoice Saved', description: `Invoice created for ${result.validatedData.customer_name || 'customer'}.` });
+  };
+
   const handleImportAll = async (file: File) => {
     try {
       const imported = await importHistory(file);
@@ -302,6 +388,7 @@ export default function HomePage() {
         history={history}
         onUploadClick={() => fileInputRef.current?.click()}
         onCameraClick={() => setIsCameraOpen(true)}
+        onNewInvoiceClick={() => setShowNewInvoiceChooser(true)}
         isOnline={isOnline}
         offlineQueueCount={offlineQueueCount}
       />
@@ -382,6 +469,10 @@ export default function HomePage() {
               <Camera className="h-4 w-4 flex-shrink-0" />
               <span className="truncate text-sm">Scan</span>
             </button>
+            <button className="action-btn-primary flex-1 min-w-0 !bg-violet-500 hover:!bg-violet-600" onClick={() => setShowNewInvoiceChooser(true)}>
+              <Plus className="h-4 w-4 flex-shrink-0" />
+              <span className="truncate text-sm">New</span>
+            </button>
           </div>
         )}
 
@@ -410,6 +501,39 @@ export default function HomePage() {
         <CameraView
           onCapture={async (d) => { setIsCameraOpen(false); await handleImageSubmit(d); }}
           onOpenChange={setIsCameraOpen}
+        />
+      )}
+
+      {helpModalResult && (
+        <AIHelpModal
+          fields={buildHelpFields(helpModalResult.validatedData, helpModalResult.errors)}
+          previewImageUri={lastImageUri || undefined}
+          onSubmit={handleHelpSubmit}
+          onSkip={handleHelpSkip}
+        />
+      )}
+
+      {showNewInvoiceChooser && (
+        <NewInvoiceChooser
+          onClose={() => setShowNewInvoiceChooser(false)}
+          onSelectManual={() => { setShowNewInvoiceChooser(false); setShowManualModal(true); }}
+          onSelectVoice={() => { setShowNewInvoiceChooser(false); setShowVoiceModal(true); }}
+        />
+      )}
+
+      {showManualModal && (
+        <ManualInvoiceModal
+          onClose={() => setShowManualModal(false)}
+          onSubmit={handleManualInvoiceSubmit}
+          currency={settings.currency}
+        />
+      )}
+
+      {showVoiceModal && (
+        <VoiceInvoiceModal
+          onClose={() => setShowVoiceModal(false)}
+          onSubmit={handleVoiceInvoiceSubmit}
+          currency={settings.currency}
         />
       )}
 

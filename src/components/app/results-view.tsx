@@ -555,7 +555,7 @@ export const ResultsView = ({
         </div>
       )}
 
-      {/* ── #20 SEND TO MANAGER ── */}
+      {/* ── #20 SEND TO EMAIL ── */}
       {(result.riskVerdict?.verdict === 'ESCALATE' || result.riskVerdict?.verdict === 'CAUTION') && (
         <div className="rounded-2xl border-2 border-amber-300 bg-amber-50 dark:bg-amber-950/30 overflow-hidden">
           <button
@@ -564,7 +564,7 @@ export const ResultsView = ({
           >
             <span className="font-bold text-amber-700 dark:text-amber-300 flex items-center gap-2">
               <Send className="h-5 w-5" />
-              Send to Manager
+              Send to Email
             </span>
             {showManagerMsg ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
           </button>
@@ -572,26 +572,32 @@ export const ResultsView = ({
             const vendor   = editedData.customer_name || 'Unknown Vendor';
             const invNo    = editedData.invoice_number ? `#${editedData.invoice_number}` : '(no number)';
             const total    = editedData.total !== undefined ? editedData.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : '?';
-            const verdict  = result.riskVerdict?.verdict ?? 'CAUTION';
+            const verdictLabel = result.riskVerdict?.verdict ?? 'CAUTION';
             const reason   = result.riskVerdict?.reason ?? 'Issues found.';
-            const problems = result.errors.slice(0, 3).map(e => e.message.split(' → ')[0].replace(/^[^w]*/,'')).join('; ');
-            const msg = `🛑 INVOICE ALERT \n\nVerdict: ${verdict}\nVendor: ${vendor}\nInvoice: ${invNo}\nTotal: ${currency} ${total}\n\nIssue: ${reason}\n\nDetails: ${problems}\n\nPlease advise before I collect payment.`;
+            const problems = result.errors.slice(0, 3).map(e => e.message.split(' → ')[0]).join('\n- ');
+            const subject  = `[InvoiceGuard] ${verdictLabel} — ${vendor} Invoice ${invNo}`;
+            const body     = `Invoice Alert\n\nVerdict: ${verdictLabel}\nVendor: ${vendor}\nInvoice: ${invNo}\nTotal: ${currency} ${total}\n\nIssue: ${reason}\n\nProblems:\n- ${problems}\n\nPlease advise before payment is collected.`;
             return (
               <div className="px-4 pb-4 border-t border-amber-200 dark:border-amber-800 space-y-3 pt-3">
-                <pre className="text-xs bg-white dark:bg-amber-950/20 border border-amber-200 rounded-xl p-3 whitespace-pre-wrap font-mono text-amber-900 dark:text-amber-200">{msg}</pre>
+                <div className="bg-white dark:bg-amber-950/20 border border-amber-200 rounded-xl p-3 space-y-1">
+                  <p className="text-xs font-bold text-amber-700 dark:text-amber-400">Subject</p>
+                  <p className="text-xs font-mono text-amber-900 dark:text-amber-200 leading-snug">{subject}</p>
+                  <p className="text-xs font-bold text-amber-700 dark:text-amber-400 mt-2">Body</p>
+                  <pre className="text-xs font-mono text-amber-900 dark:text-amber-200 whitespace-pre-wrap leading-snug">{body}</pre>
+                </div>
                 <div className="flex gap-2">
                   <button
-                    className="flex-1 h-11 rounded-xl bg-green-600 text-white font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+                    className="flex-1 h-11 rounded-xl bg-blue-600 text-white font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
                     onClick={() => {
-                      const encoded = encodeURIComponent(msg);
-                      window.open(`https://wa.me/?text=${encoded}`, '_blank');
+                      const mailto = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+                      window.open(mailto, '_self');
                     }}
                   >
-                    <MessageCircle className="h-4 w-4" /> WhatsApp Manager
+                    <Send className="h-4 w-4" /> Open in Email App
                   </button>
                   <button
                     className="flex-1 h-11 rounded-xl border-2 border-amber-400 text-amber-700 dark:text-amber-300 font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
-                    onClick={() => { navigator.clipboard.writeText(msg); toast({ title: 'Message copied ✓' }); }}
+                    onClick={() => { navigator.clipboard.writeText(`Subject: ${subject}\n\n${body}`); toast({ title: 'Email copied ✓' }); }}
                   >
                     <Copy className="h-4 w-4" /> Copy
                   </button>

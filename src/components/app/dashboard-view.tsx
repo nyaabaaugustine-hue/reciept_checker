@@ -16,7 +16,7 @@ import {
 import {
   ShieldCheck, ShieldAlert, FileText, TrendingUp,
   AlertTriangle, BadgeCheck, Search, CalendarClock,
-  Package, Users, Download, Camera, Upload,
+  Package, Users, Download, Camera, Upload, Plus,
 } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 
@@ -24,6 +24,7 @@ interface DashboardViewProps {
   history: InvoiceProcessingResult[];
   onUploadClick: () => void;
   onCameraClick: () => void;
+  onNewInvoiceClick?: () => void;
   isOnline?: boolean;
   offlineQueueCount?: number;
 }
@@ -72,7 +73,7 @@ function exportDailyReport(history: InvoiceProcessingResult[]) {
 }
 
 export const DashboardView = ({
-  history, onUploadClick, onCameraClick, isOnline = true, offlineQueueCount = 0,
+  history, onUploadClick, onCameraClick, onNewInvoiceClick, isOnline = true, offlineQueueCount = 0,
 }: DashboardViewProps) => {
   const [isClient, setIsClient] = useState(false);
   const [nlQuery, setNlQuery] = useState('');
@@ -109,9 +110,20 @@ export const DashboardView = ({
     <div className="w-full space-y-4 animate-fade-in-up">
 
       {/* Page title */}
-      <div>
-        <h2 className="text-2xl font-bold">Dashboard</h2>
-        <p className="text-muted-foreground text-sm">Every scan protects your money</p>
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-bold">Dashboard</h2>
+          <p className="text-muted-foreground text-sm">Every scan protects your money</p>
+        </div>
+        {onNewInvoiceClick && (
+          <button
+            onClick={onNewInvoiceClick}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-violet-500 hover:bg-violet-600 active:scale-95 text-white font-bold text-sm flex-shrink-0 transition-colors"
+          >
+            <Plus className="h-4 w-4" />
+            New Invoice
+          </button>
+        )}
       </div>
 
       {/* ── OFFLINE BANNER ── */}

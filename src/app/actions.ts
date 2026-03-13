@@ -138,6 +138,41 @@ async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// DOCUMENT TYPE GUARD — reject non-invoices before OCR pipeline
+// ─────────────────────────────────────────────────────────────
+
+const DOCUMENT_GUARD_PROMPT = `Look at this image carefully. Your only job is to decide if it is a financial document.
+
+Financial documents include: invoices, receipts, bills, purchase orders, delivery notes, payment slips, POS printouts, proforma invoices, quotes with amounts, GRA tax invoices, or any paper/screen showing a monetary transaction.
+
+Respond with ONLY a JSON object, nothing else:
+{
+  "is_financial_document": true or false,
+  "detected_as": "one short phrase describing what the image actually is",
+  "confidence": "high" or "medium" or "low"
+}`;
+
+async function guardDocumentType(imageUrl: string, apiKey: string): Promise<{ ok: boolean; detectedAs: string }> {
+  try {
+    const raw = await callGroqVision(imageUrl, DOCUMENT_GUARD_PROMPT, apiKey);
+    const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+    let parsed: any;
+    try { parsed = JSON.parse(cleaned); } catch { const m = cleaned.match(/\{[\s\S]*\}/); parsed = m ? JSON.parse(m[0]) : null; }
+    if (!parsed) return { ok: true, detectedAs: 'unknown' }; // don't block on parse failure
+    const isDoc: boolean = parsed.is_financial_document === true;
+    const detectedAs: string = String(parsed.detected_as ?? 'unknown image');
+    const confidence: string = String(parsed.confidence ?? 'low');
+    // Only block when confident it's NOT a financial document
+    if (!isDoc && confidence !== 'low') {
+      return { ok: false, detectedAs };
+    }
+    return { ok: true, detectedAs };
+  } catch {
+    return { ok: true, detectedAs: 'unknown' }; // fail open — don't block on network error
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // GROQ CALLERS
 // ─────────────────────────────────────────────────────────────
 
@@ -337,7 +372,7 @@ function buildMathPreCheckPrompt(transcription: string): string {
 CRITICAL RULES:
 - Use ONLY numbers from the transcription below
 - Do NOT apply any tax rates or accounting rules
-- If tax/VAT is NOT in the transcription, that is normal — VAT may be in product prices
+- If tax/VAT is NOT in the transcription, that is NORMAL and ACCEPTED in Ghana — VAT may already be included in product prices. Do NOT flag missing VAT as an error.
 - Set any NONE or "?" value to null — never estimate
 - Only flag a discrepancy if numbers that ARE present do not add up
 
@@ -375,7 +410,7 @@ Respond ONLY with JSON (no markdown):
   "currency_mismatches": ["item name and what currency symbol appeared"],
   "running_total_chain": ["step 1: subtotal = X", "step 2: +NHIL = Y", "..."],
   "is_gra_invoice": true_or_false,
-  "vat_inclusive_pricing_likely": true_or_false,
+  "vat_inclusive_pricing_likely": true_or_false, // true = no separate VAT rows, prices include tax — this is VALID in Ghana, not an error
   "corrected_grand_total": number_or_null,
   "math_notes": ["observations"]
 }`;
@@ -415,7 +450,7 @@ EXTRACTION RULES:
 
 1. NULL RULE: NONE or "?" → null. NEVER invent.
 2. TOTAL RULE: "total" = final payable. For GRA: row (vii).
-3. VAT/TAX RULE: Only set tax fields if EXPLICITLY on document. If absent → vat_included_in_prices: true, all tax fields null.
+3. VAT/TAX RULE: Only set tax fields if EXPLICITLY on document. If absent → vat_included_in_prices: true, all tax fields null. In Ghana, VAT-inclusive pricing is perfectly legal — do NOT invent or compute tax rows that are not physically on the document.
 4. SUBTOTAL RULE: null if no explicit subtotal row.
 5. VENDOR RULE: "customer_name" = SELLER/VENDOR at top.
 6. CONFIDENCE: "high"=clear, "medium"=partially visible, "low"=uncertain/blurry.
@@ -440,6 +475,7 @@ Respond ONLY with valid JSON (no markdown):
   "writing_type": "PRINTED|HANDWRITTEN|MIXED",
   "is_gra_invoice": true_or_false,
   "vat_included_in_prices": true_or_false,
+  // true when no separate VAT/tax rows exist — prices already include tax. This is normal and accepted in Ghana.
   "supplier_tin": "string or null",
   "currency": "GHS or detected currency code",
   "header_currency": "currency from header or null",
@@ -605,7 +641,7 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
   const vatIncluded = !taxExplicitlyPresent || ai.vat_included_in_prices === true;
 
   if (vatIncluded && !taxExplicitlyPresent) {
-    mathNotes.push('No tax/VAT rows on invoice — VAT treated as already included in product prices. Tax calculations skipped.');
+    mathNotes.push('No VAT rows on invoice — treated as VAT-inclusive pricing (accepted in Ghana). No tax calculations applied.');
   }
 
   // ── Tax derivation ──
@@ -922,7 +958,7 @@ function buildRiskVerdict(params: {
       reason = `Invoice total was auto-corrected arithmetically to ${total?.toFixed(2) ?? '?'}. Verify against the physical invoice before collecting.`;
       details.push(`→ Fix: Confirm the total on the physical invoice matches ${total?.toFixed(2) ?? '?'}.`);
     } else {
-      const vatNote = vatIncluded ? ' (VAT already in prices)' : '';
+      const vatNote = vatIncluded && !taxExplicitlyPresent ? ' (VAT-inclusive pricing)' : '';
       reason = `All checks passed. Invoice total is ${total?.toFixed(2) ?? '?'}${vatNote}. Safe to collect.`;
     }
   } else {
@@ -986,6 +1022,17 @@ export async function processInvoice(
 
     const imageUrl = await ensureImageUnderLimit(imageBase64);
     console.log(`[Invoice] Image size: ${Math.round((imageUrl.split(',')[1]?.length ?? 0) / 1024)}KB base64`);
+
+    // ── DOCUMENT TYPE GUARD — fast check before expensive pipeline ──
+    console.log('[Invoice] Document guard: checking image is a financial document...');
+    const guard = await guardDocumentType(imageUrl, groqApiKey);
+    if (!guard.ok) {
+      throw new Error(
+        `This doesn't look like an invoice or receipt — it appears to be a ${guard.detectedAs}. ` +
+        `Please scan or upload an actual invoice, receipt, or payment document.`
+      );
+    }
+    console.log(`[Invoice] Document guard passed: ${guard.detectedAs}`);
 
     // ── PASS 1: Universal OCR ──
     console.log('[Invoice] Pass 1: universal OCR...');
@@ -1099,7 +1146,8 @@ export async function processInvoice(
       customer_name:  ai.customer_name || undefined,
       category:       ai.category || undefined,
       subtotal:       math.correctedSubtotal,
-      tax:            math.vatIncluded ? undefined : math.correctedTax,
+      // tax: only set if explicitly on the invoice. If VAT-inclusive pricing, leave undefined (accepted in Ghana, no error).
+      tax:            (!math.vatIncluded && math.correctedTax !== undefined) ? math.correctedTax : undefined,
       total:          math.correctedTotal ?? parseNumber(ai.total),
       items: (ai.items ?? []).map((item: any) => ({
         name:       item.name || undefined,
@@ -1176,10 +1224,12 @@ export async function processInvoice(
       }
     }
 
-    // Tax rate check (non-GRA explicit tax)
+    // Tax rate check (non-GRA explicit tax only — skip entirely if VAT is included in prices)
+    // In Ghana, VAT-inclusive pricing is accepted. Only flag if tax rows ARE explicitly on the invoice
+    // AND the rate is wildly off (more than 15 percentage points, not 8, to reduce false positives).
     if (!math.vatIncluded && !ai.is_gra_invoice && validatedData.subtotal && validatedData.tax && validatedData.subtotal > 0) {
       const impliedRate = Math.round((validatedData.tax / validatedData.subtotal) * 10000) / 100;
-      if (impliedRate > 0 && Math.abs(impliedRate - taxRatePct) > 8) {
+      if (impliedRate > 0 && Math.abs(impliedRate - taxRatePct) > 15) {
         errors.push({
           field: 'tax',
           message: `Unusual tax rate: ${impliedRate}% (expected ~${taxRatePct}%). → Verify with vendor or manager before collecting.`
@@ -1299,7 +1349,7 @@ export async function processInvoice(
     const isValid = errors.length === 0;
     const vatNote = math.vatIncluded ? ' | VAT in prices' : ` | Tax: ${validatedData.tax?.toFixed(2) ?? 'N/A'}`;
     const ocrText =
-      `[InvoiceGuard v7.0 | ${ai.currency ?? 'GHS'} | ${ai.document_type_observed ?? (ai.is_gra_invoice ? 'GRA Invoice' : 'Invoice')} | ${ai.writing_type ?? 'unknown'}${vatNote}]\n\n` +
+      `[InvoiceGuard v7.0 | ${ai.currency ?? 'GHS'} | ${ai.document_type_observed ?? (ai.is_gra_invoice ? 'GRA Invoice' : 'Invoice')} | ${ai.writing_type ?? 'unknown'} | ${math.vatIncluded ? 'VAT-inclusive pricing (no separate tax rows — accepted in Ghana)' : 'Tax rows present'}]\n\n` +
       `PASS 1 OCR:\n${transcription}\n\n` +
       (mathCheck ? `Math Pre-Check: items_sum=${mathCheck.items_sum ?? 'N/A'} subtotal=${mathCheck.subtotal_from_transcription ?? 'N/A'} tax=${mathCheck.tax_sum_from_transcription ?? 'N/A (VAT in prices)'} total=${mathCheck.grand_total_from_transcription}\n` : '') +
       (math.runningTotalChain.length ? `Running Total: ${math.runningTotalChain.join(' → ')}\n\n` : '') +
