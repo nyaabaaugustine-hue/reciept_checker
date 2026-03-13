@@ -20,7 +20,7 @@ import {
   checkRiskThreshold,
 } from '@/lib/invoice-intelligence';
 import { exportAllHistory, importHistory } from '@/lib/utils';
-import { Camera, Upload, History, LayoutDashboard, X, Plus } from 'lucide-react';
+import { Camera, Upload, History, LayoutDashboard, X } from 'lucide-react';
 import { NewInvoiceChooser } from '@/components/app/new-invoice-chooser';
 import { ManualInvoiceModal } from '@/components/app/manual-invoice-modal';
 import { VoiceInvoiceModal } from '@/components/app/voice-invoice-modal';
@@ -469,15 +469,11 @@ export default function HomePage() {
               <Camera className="h-4 w-4 flex-shrink-0" />
               <span className="truncate text-sm">Scan</span>
             </button>
-            <button className="action-btn-primary flex-1 min-w-0 !bg-violet-500 hover:!bg-violet-600" onClick={() => setShowNewInvoiceChooser(true)}>
-              <Plus className="h-4 w-4 flex-shrink-0" />
-              <span className="truncate text-sm">New</span>
-            </button>
           </div>
         )}
 
         {showInstallPrompt && (
-          <div className="pwa-banner no-print">
+          <div className="pwa-banner no-print" style={{ bottom: 'calc(72px + env(safe-area-inset-bottom, 0px) + 8px)' }}>
             <div className="flex-1 min-w-0">
               <p className="font-bold text-sm truncate">Add to Home Screen</p>
               <p className="text-xs opacity-80 truncate">Use InvoiceGuard like a native app</p>
