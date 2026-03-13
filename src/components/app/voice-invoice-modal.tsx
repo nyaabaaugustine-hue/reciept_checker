@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { X, Mic, MicOff, Sparkles, CheckCircle, RotateCcw, Loader2, Volume2 } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import type { InvoiceProcessingResult, ValidatedData } from '@/lib/types';
+import { parseVoiceTranscript } from '@/app/actions';
 
 interface VoiceInvoiceModalProps {
   onClose: () => void;
@@ -189,41 +190,17 @@ export function VoiceInvoiceModal({ onClose, onSubmit, currency }: VoiceInvoiceM
   const processTranscript = async (text: string) => {
     setStage('processing');
     try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          messages: [{
-            role: 'user',
-            content: `You are an invoice parser. The user has verbally described items for an invoice. Extract the line items, customer name (if mentioned), and compute totals. Apply 15% tax unless the user specifies otherwise.
-
-Respond ONLY with a valid JSON object (no markdown fences, no preamble) with this exact structure:
-{
-  "customer_name": "string or null",
-  "invoice_number": "string or null",
-  "items": [
-    {"name": "string", "quantity": number, "unit_price": number, "line_total": number}
-  ],
-  "subtotal": number,
-  "tax": number,
-  "total": number,
-  "notes": "string or null"
-}
-
-User said: "${text}"`,
-          }],
-        }),
-      });
-      const data = await response.json();
-      const aiText = data.content?.find((c: any) => c.type === 'text')?.text || '';
-      // Try parsing directly as JSON first (no fences)
+      const aiText = await parseVoiceTranscript(text);
       let parsed: ParsedInvoice;
       try {
         parsed = normalizeInvoice(JSON.parse(aiText.trim()));
       } catch {
         parsed = parseAIResponse(aiText);
+      }
+      if (!parsed.items.length) {
+        setErrorMsg('No items detected. Try again and clearly say each item, quantity and price.');
+        setStage('idle');
+        return;
       }
       setParsedInvoice(parsed);
       setStage('review');

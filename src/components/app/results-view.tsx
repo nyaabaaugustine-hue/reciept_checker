@@ -53,8 +53,13 @@ function buildChecklist(result: InvoiceProcessingResult): CheckItem[] {
   const errorFields = new Set(result.errors.map(e => e.field));
   const items: CheckItem[] = [];
   items.push({ label: 'Invoice number', passed: !!d.invoice_number, detail: d.invoice_number ?? undefined });
-  items.push({ label: 'Vendor name', passed: !!d.customer_name, detail: d.customer_name ?? undefined });
-  items.push({ label: 'Invoice date', passed: !!d.date && !errorFields.has('date'), detail: d.date ?? undefined });
+  items.push({ label: 'Customer name', passed: !!d.customer_name, detail: d.customer_name ?? undefined });
+  // Date: show overdue months if date is present but flagged
+  const dateOverdueDetail = (() => {
+  if (!d.date) return undefined;
+  return d.date;
+  })();
+  items.push({ label: 'Invoice date', passed: !!d.date && !errorFields.has('date'), detail: dateOverdueDetail });
   items.push({ label: 'Line items found', passed: !!(d.items && d.items.length > 0), detail: d.items?.length ? `${d.items.length} item${d.items.length !== 1 ? 's' : ''}` : undefined });
   items.push({ label: 'Grand total readable', passed: d.total !== undefined && !errorFields.has('total'), detail: d.total !== undefined ? d.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : undefined });
   items.push({ label: 'Subtotal present', passed: d.subtotal !== undefined, detail: d.subtotal !== undefined ? d.subtotal.toFixed(2) : undefined });
@@ -112,22 +117,22 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
       else if (err.field === 'price_memory') { warnings.push(problem); actions.push('Query the price change with the customer before approving.'); }
     });
   } else {
-    actions.push('All figures verified. Safe to collect payment.');
+    actions.push('All figures verified. Safe to submit this invoice.');
     actions.push(`File under "${category}" in your records.`);
   }
 
   const headline = isValid
-    ? `✅ ${customer} — ${total} is verified. Safe to collect.`
-    : `⚠️ ${customer} — ${errors.length} issue${errors.length !== 1 ? 's' : ''} found. Do NOT accept payment yet.`;
+    ? `✅ ${customer} — GH¢${total} — Invoice is correct. Safe to submit.`
+    : `⚠️ ${customer} — ${errors.length} issue${errors.length !== 1 ? 's' : ''} found. Fix before submitting.`;
 
   return { headline, paragraphs, warnings, actions };
 }
 
 const VERDICT_CONFIG = {
-  ACCEPT:  { bg: 'bg-green-600',  border: 'border-green-500',  text: 'text-green-700 dark:text-green-300',  icon: ShieldCheck,  label: '🟢 ACCEPT — Collect the money'    },
-  CAUTION: { bg: 'bg-amber-500',  border: 'border-amber-400',  text: 'text-amber-700 dark:text-amber-300',  icon: AlertCircle,  label: '🟡 CAUTION — Review before collecting' },
-  REJECT:  { bg: 'bg-red-600',    border: 'border-red-500',    text: 'text-red-700 dark:text-red-300',      icon: Ban,          label: '🔴 REJECT — Do NOT collect money'  },
-  ESCALATE:{ bg: 'bg-orange-600', border: 'border-orange-500', text: 'text-orange-700 dark:text-orange-300',icon: TrendingUp,   label: '🟠 ESCALATE — Call your manager'   },
+  ACCEPT:  { bg: 'bg-green-600',  border: 'border-green-500',  text: 'text-green-700 dark:text-green-300',  icon: ShieldCheck,  label: '🟢 GOOD — Invoice is correct. Safe to submit.'    },
+  CAUTION: { bg: 'bg-amber-500',  border: 'border-amber-400',  text: 'text-amber-700 dark:text-amber-300',  icon: AlertCircle,  label: '🟡 CHECK — Fix the flagged issues before submitting.' },
+  REJECT:  { bg: 'bg-red-600',    border: 'border-red-500',    text: 'text-red-700 dark:text-red-300',      icon: Ban,          label: '🔴 DO NOT SUBMIT — Serious problem found.'  },
+  ESCALATE:{ bg: 'bg-orange-600', border: 'border-orange-500', text: 'text-orange-700 dark:text-orange-300',icon: TrendingUp,   label: '🟠 REWRITE — Numbers do not add up. Correct and rescan.' },
 } as const;
 
 export const ResultsView = ({
@@ -231,7 +236,7 @@ export const ResultsView = ({
   const verdictCfg = VERDICT_CONFIG[verdict];
   const VerdictIcon = verdictCfg.icon;
   const verdictBg = isApproved ? 'bg-blue-600' : isRejected ? 'bg-gray-500' : verdictCfg.bg;
-  const verdictText = isApproved ? 'Approved — Safe to Collect' : isRejected ? 'Invoice Rejected' : verdictCfg.label;
+  const verdictText = isApproved ? '✅ Submitted — Invoice Accepted' : isRejected ? '✏️ Marked for Rewrite' : verdictCfg.label;
 
   const passedCount = checklist.filter(c => c.passed).length;
   const failedCount = checklist.filter(c => !c.passed).length;
@@ -881,13 +886,13 @@ export const ResultsView = ({
                 style={{ background: '#16a34a' }}
                 onClick={() => onApprove(result.id)}
               >
-                <ThumbsUp className="h-5 w-5" /> Approve — Collect
+                <ThumbsUp className="h-5 w-5" /> Submit Invoice
               </button>
               <button
                 className="action-btn-secondary flex-1 border-red-400 text-red-600"
                 onClick={() => setShowRejectInput(true)}
               >
-                <ThumbsDown className="h-5 w-5" /> Reject
+                <ThumbsDown className="h-5 w-5" /> Rewrite
               </button>
             </div>
           </div>
@@ -897,7 +902,7 @@ export const ResultsView = ({
       {/* Approved/rejected confirmation */}
       {!canAct && (
         <div className={`rounded-2xl p-4 text-center font-bold text-lg ${isApproved ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'}`}>
-          {isApproved ? '✅ Approved' : '❌ Rejected'}
+          {isApproved ? '✅ Submitted' : '✏️ Rewrite Required'}
           {isApproved && result.approvedAt && <p className="text-sm font-normal mt-1">{new Date(result.approvedAt).toLocaleString()}</p>}
           {isRejected && result.rejectionReason && <p className="text-sm font-normal mt-1">{result.rejectionReason}</p>}
         </div>

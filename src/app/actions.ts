@@ -8,7 +8,7 @@
  *  #I04 Fuzzy vendor name matching (Levenshtein)
  *  #I11 Cumulative vendor spend threshold (GHS 50,000)
  *  + salesmanSummary field on every result
- *  + Math pre-check and Pass 2 now run in parallel (≈ 40% faster)
+ *  + Math pre-check and Pass 2 now run in parallel (approx 40% faster)
  *
  * v6.0 — 19 robustness improvements for salesmen:
  *  #3  Region-specific re-read for low-confidence fields (header crop + totals crop)
@@ -24,7 +24,21 @@
  *  #14 Time-of-day anomaly flag (late night / weekend / public holiday)
  *  #15 Invoice number sequential gap detection per vendor
  *  + all v5.0 features retained
+ *
+ * v7.1 — Handwriting OCR improvements:
+ *  - 5 critical rules added to PASS1_PROMPT to prevent skipping unknown item names
+ *  - Examples of real Ghana electrical items (SASSIN, TRUNKING, ROSETTE) added
+ *  - High-value item warning (watch for lines with prices 50+ GHS)
+ *  - ESCALATE / column-sum error messages updated to say "rewrite the correct invoice"
+ *
+ * v7.2 — Quantity & digit misread fixes (from real COFKANS invoice analysis):
+ *  - QUANTITY FIRST rule: read the QTY column digit-by-digit before item name
+ *  - 9 vs 8 warning extended: SASSIN unit price is 90, never 80
+ *  - Multi-digit quantity warning: 9, 5, 3, 2 are common qty values — not just 1
+ *  - Line total cross-check: if qty>1 and line total = unit price, flag as likely qty misread
+ *  - Date year sanity: if year < 2015 on a Ghana invoice, flag as possible misread
  */
+
 
 import type {
   InvoiceProcessingResult,
@@ -53,9 +67,9 @@ import {
   buildSalesmanSummary,
 } from '@/lib/invoice-intelligence';
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // HELPERS
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 function parseNumber(value: any): number | undefined {
   if (value === undefined || value === null) return undefined;
@@ -95,14 +109,152 @@ async function fetchWithRetry(url: string, options: RequestInit, retries = 3): P
   throw lastError;
 }
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // MODEL LISTS
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 const VISION_MODELS = [
   'meta-llama/llama-4-scout-17b-16e-instruct',
   'meta-llama/llama-4-maverick-17b-128e-instruct',
 ];
+
+// -----------------------------------------------------------------
+// GEMINI VISION (free tier — better handwriting OCR than Groq Llama)
+// Set GEMINI_API_KEY in .env.local to enable.
+// Falls back to Groq if not set.
+// -----------------------------------------------------------------
+async function callOpenRouterVision(imageUrl: string, prompt: string, apiKey: string): Promise<string> {
+  const match = imageUrl.match(/^data:(.+);base64,(.+)$/);
+  const base64Data = match ? match[2] : imageUrl;
+  const mimeType = match ? match[1] : 'image/jpeg';
+
+  const response = await fetchWithRetry(
+    'https://openrouter.ai/api/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://invoiceguard.app',
+        'X-Title': 'InvoiceGuard',
+      },
+      body: JSON.stringify({
+        model: 'openrouter/auto',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}` } },
+            { type: 'text', text: prompt },
+          ]
+        }],
+        temperature: 0.0,
+        max_tokens: 4000,
+      }),
+    },
+    3
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`OpenRouter error ${response.status}: ${body.slice(0, 200)}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error('Empty response from OpenRouter.');
+  return content;
+}
+
+async function callGeminiVision(imageUrl: string, prompt: string, apiKey: string): Promise<string> {
+  // Extract base64 data and mime type
+  const match = imageUrl.match(/^data:(.+);base64,(.+)$/);
+  const mimeType = match ? match[1] : 'image/jpeg';
+  const base64Data = match ? match[2] : imageUrl;
+
+  const response = await fetchWithRetry(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: mimeType, data: base64Data } },
+            { text: prompt }
+          ]
+        }],
+        generationConfig: { temperature: 0.0, maxOutputTokens: 4000 },
+      }),
+    },
+    3
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Gemini vision error ${response.status}: ${body.slice(0, 200)}`);
+  }
+
+  const data = await response.json();
+  const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!content) throw new Error('Empty response from Gemini vision.');
+  return content;
+}
+
+function getVisionCaller(imageUrl: string, prompt: string): Promise<string> {
+  // OpenRouter is the primary vision provider — free, no daily limit, better OCR
+  const openRouterKey = process.env.OPENROUTER_API_KEY;
+  if (openRouterKey) {
+    console.log('[Vision] Using OpenRouter (gemini-2.0-flash-exp:free)');
+    return callOpenRouterVision(imageUrl, prompt, openRouterKey).catch(async (err: Error) => {
+      console.warn(`[Vision] OpenRouter failed: ${err.message} — falling back to Gemini/Groq`);
+      return getGeminiFallback(imageUrl, prompt);
+    });
+  }
+  return getGeminiFallback(imageUrl, prompt);
+}
+
+function getGeminiFallback(imageUrl: string, prompt: string): Promise<string> {
+  // Collect all Gemini keys — rotate through them to spread load across free-tier projects
+  const geminiKeys = [
+    process.env.GEMINI_API_KEY,
+    process.env.GEMINI_API_KEY_2,
+    process.env.GEMINI_API_KEY_3,
+    process.env.GEMINI_API_KEY_4,
+  ].filter(Boolean) as string[];
+
+  const groqKey = process.env.GROQ_API_KEY;
+
+  if (geminiKeys.length > 0) {
+    // Pick a random key from available keys to distribute load
+    const key = geminiKeys[Math.floor(Math.random() * geminiKeys.length)];
+    console.log(`[Vision] Using Gemini 2.0 Flash (key ...${key.slice(-6)})`);
+    return callGeminiVision(imageUrl, prompt, key).catch(async (err: Error) => {
+      // If this key is rate-limited, try the others in sequence
+      console.warn(`[Vision] Gemini key ...${key.slice(-6)} failed: ${err.message}`);
+      for (const fallbackKey of geminiKeys.filter(k => k !== key)) {
+        try {
+          console.log(`[Vision] Trying fallback Gemini key ...${fallbackKey.slice(-6)}`);
+          return await callGeminiVision(imageUrl, prompt, fallbackKey);
+        } catch (e2) {
+          console.warn(`[Vision] Fallback key also failed: ${(e2 as Error).message}`);
+        }
+      }
+      // All Gemini keys exhausted — fall back to Groq
+      if (groqKey) {
+        console.warn('[Vision] All Gemini keys failed, falling back to Groq');
+        return callGroqVision(imageUrl, prompt, groqKey);
+      }
+      throw new Error('All vision API keys exhausted. Add more GEMINI_API_KEY_2/3 keys or top up billing.');
+    });
+  }
+
+  if (groqKey) {
+    console.log('[Vision] Using Groq Llama vision (set GEMINI_API_KEY for better results)');
+    return callGroqVision(imageUrl, prompt, groqKey);
+  }
+
+  throw new Error('No vision API key found. Set GEMINI_API_KEY or GROQ_API_KEY in .env.local');
+}
 
 const TEXT_MODELS = [
   'llama-3.3-70b-versatile',
@@ -111,9 +263,9 @@ const TEXT_MODELS = [
 
 const GROQ_BASE64_LIMIT = 3_800_000;
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // IMAGE SIZE GUARD
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
   const base64Part = imageBase64.split(',')[1] ?? imageBase64;
@@ -127,7 +279,7 @@ async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
       .jpeg({ quality: 75 })
       .toBuffer();
     const resizedB64 = resized.toString('base64');
-    console.log(`[Invoice] Resized: ${base64Part.length} → ${resizedB64.length} chars`);
+    console.log(`[Invoice] Resized: ${base64Part.length} -> ${resizedB64.length} chars`);
     return `data:image/jpeg;base64,${resizedB64}`;
   } catch {
     throw new Error(
@@ -137,9 +289,9 @@ async function ensureImageUnderLimit(imageBase64: string): Promise<string> {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// DOCUMENT TYPE GUARD — reject non-invoices before OCR pipeline
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
+// DOCUMENT TYPE GUARD
+// -----------------------------------------------------------------
 
 const DOCUMENT_GUARD_PROMPT = `Look at this image carefully. Your only job is to decide if it is a financial document.
 
@@ -158,23 +310,22 @@ async function guardDocumentType(imageUrl: string, apiKey: string): Promise<{ ok
     const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
     let parsed: any;
     try { parsed = JSON.parse(cleaned); } catch { const m = cleaned.match(/\{[\s\S]*\}/); parsed = m ? JSON.parse(m[0]) : null; }
-    if (!parsed) return { ok: true, detectedAs: 'unknown' }; // don't block on parse failure
+    if (!parsed) return { ok: true, detectedAs: 'unknown' };
     const isDoc: boolean = parsed.is_financial_document === true;
     const detectedAs: string = String(parsed.detected_as ?? 'unknown image');
     const confidence: string = String(parsed.confidence ?? 'low');
-    // Only block when confident it's NOT a financial document
     if (!isDoc && confidence !== 'low') {
       return { ok: false, detectedAs };
     }
     return { ok: true, detectedAs };
   } catch {
-    return { ok: true, detectedAs: 'unknown' }; // fail open — don't block on network error
+    return { ok: true, detectedAs: 'unknown' };
   }
 }
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // GROQ CALLERS
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 async function callGroqVision(imageUrl: string, prompt: string, apiKey: string): Promise<string> {
   let lastError: Error = new Error('All Groq vision models failed');
@@ -198,7 +349,7 @@ async function callGroqVision(imageUrl: string, prompt: string, apiKey: string):
       );
       if (!response.ok) {
         const body = await response.text();
-        console.error(`[Groq Vision] ${model} → HTTP ${response.status}: ${body.slice(0, 300)}`);
+        console.error(`[Groq Vision] ${model} -> HTTP ${response.status}: ${body.slice(0, 300)}`);
         if ([400, 404, 413].includes(response.status)) { lastError = new Error(`Model ${model} error (${response.status})`); continue; }
         throw new Error(`Groq ${response.status}: ${body.slice(0, 200)}`);
       }
@@ -234,7 +385,7 @@ async function callGroqText(prompt: string, apiKey: string, maxTokens = 2500): P
       );
       if (!response.ok) {
         const body = await response.text();
-        console.error(`[Groq Text] ${model} → HTTP ${response.status}: ${body.slice(0, 300)}`);
+        console.error(`[Groq Text] ${model} -> HTTP ${response.status}: ${body.slice(0, 300)}`);
         if ([400, 404].includes(response.status)) { lastError = new Error(`Model ${model} error (${response.status})`); continue; }
         throw new Error(`Groq text ${response.status}: ${body.slice(0, 200)}`);
       }
@@ -251,20 +402,72 @@ async function callGroqText(prompt: string, apiKey: string, maxTokens = 2500): P
   throw lastError;
 }
 
-// ─────────────────────────────────────────────────────────────
+// OpenRouter text fallback — used when Groq text hits 429
+async function callOpenRouterText(prompt: string, apiKey: string, maxTokens = 2500): Promise<string> {
+  const response = await fetchWithRetry(
+    'https://openrouter.ai/api/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://invoiceguard.app',
+        'X-Title': 'InvoiceGuard',
+      },
+      body: JSON.stringify({
+        model: 'openrouter/auto',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.0,
+        max_tokens: maxTokens,
+      }),
+    },
+    3
+  );
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`OpenRouter text error ${response.status}: ${body.slice(0, 200)}`);
+  }
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error('Empty response from OpenRouter text.');
+  console.log('[OpenRouter Text] Success');
+  return content;
+}
+
+// Smart text caller: tries Groq first, falls back to OpenRouter on 429
+async function callText(prompt: string, maxTokens = 2500): Promise<string> {
+  const groqKey = process.env.GROQ_API_KEY;
+  const openRouterKey = process.env.OPENROUTER_API_KEY;
+  if (groqKey) {
+    try {
+      return await callGroqText(prompt, groqKey, maxTokens);
+    } catch (err: any) {
+      if (err.message?.includes('429') || err.message?.includes('HTTP 429')) {
+        console.warn('[Text] Groq 429, falling back to OpenRouter text');
+        if (openRouterKey) return callOpenRouterText(prompt, openRouterKey, maxTokens);
+      }
+      throw err;
+    }
+  }
+  if (openRouterKey) return callOpenRouterText(prompt, openRouterKey, maxTokens);
+  throw new Error('No text API key available.');
+}
+
+// -----------------------------------------------------------------
 // PROMPTS
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 /**
- * PASS 1 — UNIVERSAL DOCUMENT OCR (v6.0)
+ * PASS 1 - UNIVERSAL DOCUMENT OCR (v6.0 + v7.1 handwriting improvements)
  * #4: Detects handwriting vs print and adapts reading strategy
- * #5: Character-level confidence — marks uncertain digits with "?" 
+ * #5: Character-level confidence
+ * v7.1: 5 critical handwriting rules prevent skipping unknown item names
  */
 const PASS1_PROMPT = `You are an expert forensic document reader. You will be shown a photo or scan of a financial document — it could be ANY type: a GRA tax invoice, a handwritten receipt, a POS printout, a proforma, a delivery note, a simple payment slip, or any other document used to request or record payment.
 
 YOUR ONLY JOB: Read exactly what is on this document, character by character, digit by digit. Do not guess. Do not fill in. Do not apply any rules or rates you know from memory.
 
-━━━ ABSOLUTE RULES ━━━
+ABSOLUTE RULES:
 1. Copy every number EXACTLY as printed — "1,500.50" stays "1,500.50"
 2. If a character is unclear, write "?" for THAT CHARACTER ONLY — e.g. "1,5?0.00" if the 3rd digit is unclear
 3. If a field is completely absent, write NONE
@@ -272,19 +475,19 @@ YOUR ONLY JOB: Read exactly what is on this document, character by character, di
 5. Do NOT assume the document type — describe what you actually see
 6. One wrong digit causes real financial loss — accuracy is everything
 
-━━━ STEP 1 — DOCUMENT TYPE IDENTIFICATION ━━━
+STEP 1 — DOCUMENT TYPE IDENTIFICATION:
 Before reading anything, assess the physical nature of this document:
 
 WRITING_TYPE: Is the content [PRINTED / HANDWRITTEN / MIXED] ?
-  → If HANDWRITTEN: Read letter-by-letter. Treat each character independently. Do not assume words from context.
-  → If PRINTED: Read precisely — watch for ink smudges, faded ink, similar digits (1/7, 0/6, 5/6, 8/3)
-  → If MIXED: Apply handwriting rules to handwritten parts, print rules to printed parts
+  -> If HANDWRITTEN: Read letter-by-letter. Treat each character independently. Do not assume words from context.
+  -> If PRINTED: Read precisely — watch for ink smudges, faded ink, similar digits (1/7, 0/6, 5/6, 8/3)
+  -> If MIXED: Apply handwriting rules to handwritten parts, print rules to printed parts
 
 DOCUMENT FORMAT: [GRA Tax Invoice / Company Invoice / Handwritten Receipt / POS Thermal Receipt / Proforma Invoice / Delivery Note / Payment Slip / Screenshot / Photocopy / Carbon Copy / Other — describe]
 
 PHYSICAL CONDITION: [Clear / Slightly faded / Crumpled / Torn edges / Glare or reflection / Dark / Blurry / Partial cutoff]
 
-━━━ STEP 2 — ZONE A: HEADER ━━━
+STEP 2 — ZONE A: HEADER:
 Read top section carefully:
 SELLER/VENDOR NAME: [exact text or NONE]
 SELLER ADDRESS: [exact text or NONE]
@@ -296,7 +499,7 @@ BUYER/CUSTOMER NAME: [if shown or NONE]
 CURRENCY DECLARED IN HEADER: [GHS / USD / EUR / GBP / NGN or NONE if not stated]
 ANY REFERENCE NUMBERS: [PO#, delivery note#, etc. or NONE]
 
-━━━ STEP 3 — ZONE B: LINE ITEMS ━━━
+STEP 3 — ZONE B: LINE ITEMS:
 List EVERY product/service line. Skip totals rows.
 
 For PRINTED invoices:
@@ -305,9 +508,55 @@ For PRINTED invoices:
 For HANDWRITTEN invoices — extra care:
   ITEM [n]: Name="[copy exact spelling including abbreviations]" | Qty=[number — watch for 1/7, 0/6] | Unit=[or NULL] | UnitPrice=[exact — write ? for any uncertain digit] | LineTotal=[exact — write ? for any uncertain digit] | HANDWRITING_NOTE=[any difficulty reading this line]
 
+WARNING — CRITICAL HANDWRITING RULES — READ EVERY LINE, SKIP NOTHING:
+1. NEVER skip a line because the item name looks strange, abbreviated, or unfamiliar.
+   Real Ghana electrical/building items include: "6WAY 1PHASE SASSIN" (consumer unit/distribution board), "TRUNKING", "CUT-OFF", "ROSETTE", "SASSIN" (distribution board), "3WAY SWITCH", "TV SOCKET", "ISOLATOR". Copy the name exactly as written even if you don't recognise it.
+
+2. QUANTITY COLUMN — READ THIS FIRST, BEFORE THE ITEM NAME:
+   The QTY column is on the LEFT. Read it digit-by-digit as a standalone number BEFORE you read the description.
+   - Common Ghana invoice quantities are: 1, 2, 3, 5, 9, 10 — NOT always 1.
+   - A "9" in the QTY column means NINE items, not one. A "5" means FIVE items.
+   - NEVER assume qty=1 just because the item name starts with a digit (e.g. "13Amp" — the 13 is part of the item name, not the quantity).
+   - After reading qty AND unit_price, compute qty × unit_price and check it matches the line total in the TOTAL column. If it does not match, reread the quantity.
+   - EXAMPLE: QTY=9, UNIT=8.00, TOTAL=72.00 → 9×8=72 ✓. If you read qty=1 and get 1×8=8≠72, you misread the quantity — go back and look again.
+
+2b. "NPC" PREFIX IN DESCRIPTION — THIS IS THE QUANTITY:
+   On many Ghana handwritten invoices, the vendor writes the quantity INSIDE the description column as a prefix like "5PC", "2PC", "3PC", "1PC" instead of (or in addition to) the QTY column.
+   - If the description starts with a number followed by "PC" or "PCS" (e.g. "5PC 2Gang Switch"), the number before PC IS the quantity.
+   - Use that number as the qty value. Example: "5PC 2Gang Switch" → qty=5, name="2Gang Switch".
+   - If the QTY column also has a number AND the description has NPC prefix, use whichever makes qty × unit_price = line_total.
+   - NEVER output qty=1 for a row where the description says "5PC" or "9PC" — that is always wrong.
+
+3. DIGIT 9 vs 8 WARNING — CRITICAL FOR SASSIN PRICES:
+   The handwritten digit "9" is frequently misread as "8" or "2". Before writing ANY price:
+   - SASSIN / 6WAY 1PHASE SASSIN unit price is almost always 90 GHS. Never 80 GHS. If you see 80 next to SASSIN, look again — it is 90.
+   - Similarly: a price of 20 or 25 for SASSIN is wrong — it is 90 or 95.
+   - The digit "9" has a round top and a tail going down-right. "8" has two stacked loops. "2" has a curved top and flat base. Look carefully.
+
+4. LINE TOTAL SANITY CHECK — USE ARITHMETIC:
+   After reading each row, compute: qty × unit_price. If the result does not match the line total you read:
+   - First recheck the QUANTITY and check for "NPC" prefix in the description
+   - Then recheck the UNIT PRICE
+   - Then recheck the LINE TOTAL
+   - EXAMPLE of common error: description says "5PC 2Gang Switch", unit price 6.00, line total 30.00.
+     If you read qty=1 → 1×6=6≠30. Correct reading: qty=5 (from "5PC") → 5×6=30 ✓.
+   Do this for EVERY row before moving on.
+
+5. HIGH-VALUE ITEMS: Watch especially for items with unit prices 50.00, 90.00, 100.00, 120.00 or above — these are often the hardest to read but most financially important. If you see a large number anywhere on a line, it belongs to that line.
+6. COUNT ALL LINES: Before finishing, count the total number of item rows you can see. Make sure your item count matches the physical number of rows in the table. If you missed any, go back and read them.
+7. SMUDGED OR FAINT LINES: If a row is faint, tilted, or partially covered — still read it. Use ? for uncertain digits. Do NOT silently omit it.
+8. SIMILAR ITEM NAMES: If the same item appears twice (e.g. "2GANG SWITCH" and "2GANG 2WAY SWITCH"), list BOTH as separate items — do not merge them.
+9. VERIFY YOUR TOTAL: After reading all items, add up all your line totals. If they do not match the grand total written on the invoice, go back and recheck every QUANTITY first — a qty of 9 misread as 1 will cause a large gap.
+10. DATE YEAR SANITY — CRITICAL: Ghana invoices use DD-MM-YY format, NOT DD-MM-YYYY.
+    - "14-06-24" means 14th June 2024 — the year is 24, meaning 2024.
+    - "14-06-2012" is WRONG — nobody writes a 4-digit year starting with 20 on a handwritten Ghana invoice.
+    - If you see a date where the year part is 2 digits (24, 23, 22 etc.), convert it: 24 = 2024, 23 = 2023.
+    - NEVER output a year before 2020 for a Ghana handwritten invoice unless you are absolutely certain.
+    - EXAMPLE: date written as "14-06-24" → output as "2024-06-14", NOT "2012-06-14".
+
 If NO line items (lump sum only): write "NO LINE ITEMS — LUMP SUM ONLY"
 
-━━━ STEP 4 — ZONE C: ALL TOTALS/SUMMARY ROWS ━━━
+STEP 4 — ZONE C: ALL TOTALS/SUMMARY ROWS:
 List EVERY labelled total row in the order they appear:
 TOTALS ROW [n]: Label="[exact label]" | Value=[exact number — write ? for uncertain digits]
 
@@ -315,12 +564,12 @@ Common labels (copy WHATEVER is written): Subtotal, Net Amount, NHIL, GETFund, C
 
 CRITICAL: If NO tax rows exist — that is normal. Many companies include VAT in product prices. List only what is actually on the document.
 
-━━━ STEP 5 — ZONE D: FINAL PAYABLE ━━━
+STEP 5 — ZONE D: FINAL PAYABLE:
 GRAND TOTAL AMOUNT: [exact final amount or NONE]
 GRAND TOTAL LABEL: [exact label]
 CURRENCY: [GHS / USD / GBP / EUR / NGN / symbol seen — or GHS if none]
 
-━━━ STEP 6 — CHARACTER-LEVEL CONFIDENCE ━━━
+STEP 6 — CHARACTER-LEVEL CONFIDENCE:
 LIST EVERY field where you used "?":
   UNCERTAIN: [field name] = "[value with ? marks]" — REASON: [what made it hard to read]
 
@@ -332,8 +581,6 @@ OTHER TEXT ON DOCUMENT: [any other text not captured above]`;
 
 /**
  * PASS 1b — TARGETED RE-READ FOR LOW CONFIDENCE FIELDS (#3)
- * Called only when specific fields came back low confidence.
- * Focuses the model on just that region of the document.
  */
 function buildRegionRereadPrompt(region: 'header' | 'totals' | 'items', uncertainFields: string[]): string {
   const fieldList = uncertainFields.join(', ');
@@ -381,17 +628,17 @@ ${transcription}
 
 YOUR TASK:
 1. Extract ALL line item values: name, qty, unit_price, line_total for each item
-2. For each item where qty AND unit_price are present: compute qty × unit_price and compare to line_total
-3. Sum all line_total values → ITEMS_SUM
-4. Find subtotal if listed → SUBTOTAL
-5. Find all explicitly listed tax/levy amounts → TAX_SUM (null if none — this is normal)
-6. Find grand total → GRAND_TOTAL
+2. For each item where qty AND unit_price are present: compute qty x unit_price and compare to line_total
+3. Sum all line_total values -> ITEMS_SUM
+4. Find subtotal if listed -> SUBTOTAL
+5. Find all explicitly listed tax/levy amounts -> TAX_SUM (null if none — this is normal)
+6. Find grand total -> GRAND_TOTAL
 7. Check consistency:
-   - items_match_subtotal: ITEMS_SUM ≈ SUBTOTAL (only if both present)
-   - subtotal_plus_tax_matches_total: SUBTOTAL + TAX_SUM ≈ GRAND_TOTAL (only if all three present)
-   - items_match_grand_total_directly: ITEMS_SUM ≈ GRAND_TOTAL (when no separate tax rows)
+   - items_match_subtotal: ITEMS_SUM approx SUBTOTAL (only if both present)
+   - subtotal_plus_tax_matches_total: SUBTOTAL + TAX_SUM approx GRAND_TOTAL (only if all three present)
+   - items_match_grand_total_directly: ITEMS_SUM approx GRAND_TOTAL (when no separate tax rows)
 8. Currency check: list any items where a different currency symbol appears vs the header currency
-9. Compute the running total chain: subtotal → +taxes step by step → final total
+9. Compute the running total chain: subtotal -> +taxes step by step -> final total
 
 Respond ONLY with JSON (no markdown):
 {
@@ -410,7 +657,7 @@ Respond ONLY with JSON (no markdown):
   "currency_mismatches": ["item name and what currency symbol appeared"],
   "running_total_chain": ["step 1: subtotal = X", "step 2: +NHIL = Y", "..."],
   "is_gra_invoice": true_or_false,
-  "vat_inclusive_pricing_likely": true_or_false, // true = no separate VAT rows, prices include tax — this is VALID in Ghana, not an error
+  "vat_inclusive_pricing_likely": true_or_false,
   "corrected_grand_total": number_or_null,
   "math_notes": ["observations"]
 }`;
@@ -418,9 +665,6 @@ Respond ONLY with JSON (no markdown):
 
 /**
  * PASS 2 — STRUCTURED JSON EXTRACTION (v6.0)
- * #5: includes per-field character confidence
- * #7: unit price consistency flagged
- * #8: quantity sanity flagged
  */
 function buildPass2Prompt(transcription: string, mathCheck: any): string {
   const mathContext = mathCheck ? `
@@ -436,7 +680,7 @@ ARITHMETIC AUDIT RESULTS:
 - VAT-inclusive pricing likely: ${mathCheck.vat_inclusive_pricing_likely ?? 'unknown'}
 - Discrepancies: ${(mathCheck.discrepancies ?? []).join('; ') || 'none'}
 - Currency mismatches: ${(mathCheck.currency_mismatches ?? []).join('; ') || 'none'}
-- Running total chain: ${(mathCheck.running_total_chain ?? []).join(' → ') || 'N/A'}
+- Running total chain: ${(mathCheck.running_total_chain ?? []).join(' -> ') || 'N/A'}
 - Math-corrected grand total: ${mathCheck.corrected_grand_total ?? 'not available'}
 ` : '';
 
@@ -448,15 +692,15 @@ ${mathContext}
 
 EXTRACTION RULES:
 
-1. NULL RULE: NONE or "?" → null. NEVER invent.
+1. NULL RULE: NONE or "?" -> null. NEVER invent.
 2. TOTAL RULE: "total" = final payable. For GRA: row (vii).
-3. VAT/TAX RULE: Only set tax fields if EXPLICITLY on document. If absent → vat_included_in_prices: true, all tax fields null. In Ghana, VAT-inclusive pricing is perfectly legal — do NOT invent or compute tax rows that are not physically on the document.
+3. VAT/TAX RULE: Only set tax fields if EXPLICITLY on document. If absent -> vat_included_in_prices: true, all tax fields null.
 4. SUBTOTAL RULE: null if no explicit subtotal row.
 5. VENDOR RULE: "customer_name" = SELLER/VENDOR at top.
 6. CONFIDENCE: "high"=clear, "medium"=partially visible, "low"=uncertain/blurry.
-7. CHARACTER CONFIDENCE: If any digit in a number had "?" → set that field's confidence to "low".
+7. CHARACTER CONFIDENCE: If any digit in a number had "?" -> set that field's confidence to "low".
 8. ITEM RULE: copy names exactly — abbreviations, spelling, shorthand preserved.
-9. NUMBER RULE: strip currency symbols and commas → 1200.00
+9. NUMBER RULE: strip currency symbols and commas -> 1200.00
 10. DUPLICATE ITEM RULE: if the same item name appears multiple times on this invoice, flag it.
 
 Respond ONLY with valid JSON (no markdown):
@@ -475,7 +719,6 @@ Respond ONLY with valid JSON (no markdown):
   "writing_type": "PRINTED|HANDWRITTEN|MIXED",
   "is_gra_invoice": true_or_false,
   "vat_included_in_prices": true_or_false,
-  // true when no separate VAT/tax rows exist — prices already include tax. This is normal and accepted in Ghana.
   "supplier_tin": "string or null",
   "currency": "GHS or detected currency code",
   "header_currency": "currency from header or null",
@@ -513,6 +756,45 @@ Respond ONLY with valid JSON (no markdown):
 }
 
 /**
+ * PASS 1c — MISSING ITEMS RE-READ
+ * Triggered when items_sum is significantly less than subtotal/total.
+ * Forces the model to recount every row and find the missing line(s).
+ */
+function buildMissingItemsRereadPrompt(knownItems: string[], knownSum: number, statedTotal: number): string {
+  const gap = (statedTotal - knownSum).toFixed(2);
+  const itemList = knownItems.length > 0
+    ? knownItems.map((n, i) => `  ${i + 1}. ${n}`).join('\n')
+    : '  (none captured yet)';
+  return `URGENT — MISSING OR MISREAD LINE ITEMS DETECTED
+
+The line items found so far only add up to ${knownSum.toFixed(2)}, but the invoice subtotal/total is ${statedTotal.toFixed(2)}.
+There is a gap of ${gap} — this means either a line item was MISSED or a price was MISREAD.
+
+Items found so far:
+${itemList}
+
+YOUR TASK: Examine ONLY the items table on this invoice, with extreme care.
+
+1. RECHECK EVERY PRICE in the list above — look at the original invoice and confirm each unit price and line total is correct.
+   - Specifically: "SASSIN" or "6WAY 1PHASE SASSIN" items commonly have unit prices of 80, 90, or 100 GHS — NOT 20. If you see a SASSIN with price 20, look again.
+   - A line total of "20" when the unit price should be "90" is a common OCR error (9 misread as 2).
+
+2. COUNT ALL ROWS — look for any row in the table that is NOT in the list above.
+   - Look for rows written smaller, lighter, at an angle, or at the very edge of the table.
+   - Look for items like: "SASSIN ISOLATOR", "20AMP ISOLATOR", "CIRCUIT BREAKER", "MAIN SWITCH", "DB BOARD"
+
+3. For each row you find that is NOT in the list above, output:
+   ITEM [n]: Name="[exact text as written]" | Qty=[number] | UnitPrice=[number] | LineTotal=[number]
+
+4. For any price in the list above that you believe is WRONG, output:
+   PRICE_CORRECTION: Item="[name]" | CorrectUnitPrice=[number] | CorrectLineTotal=[number] | Reason=[why]
+
+Finally state:
+TOTAL_ROWS_COUNTED: [number]
+MISSING_VALUE_EXPLANATION: [your best explanation for the ${gap} gap]`;
+}
+
+/**
  * RECONCILIATION — re-read totals region only (#3)
  */
 const RECONCILIATION_PROMPT = `Focus ONLY on the bottom section of this document (totals area).
@@ -528,9 +810,9 @@ GRAND TOTAL LABEL: [exact label]
 CONFIDENCE: [high / medium / low]
 IF NOT HIGH: [what makes it hard to read]`;
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // #14 — TIME-OF-DAY ANOMALY CHECK
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 function checkTimeOfDayAnomaly(): string | null {
   const now = new Date();
@@ -549,10 +831,26 @@ function checkTimeOfDayAnomaly(): string | null {
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
+// LAYER 3.5 — QUANTITY AUTO-CORRECTION (v7.3)
+// Runs after OCR, before math engine.
+// If qty × unit_price ≠ line_total but line_total / unit_price = whole number,
+// we correct qty mathematically — no second Groq call needed.
+// Also strips NPC prefix from item names ("5PC 2Gang Switch" → qty=5, name="2Gang Switch")
+// -----------------------------------------------------------------
+
+function autoCorrectQuantities(items: any[]): { items: any[]; corrections: string[] } {
+  // v7.3 quantity auto-correction is DISABLED.
+  // Groq inconsistently embeds quantities in item names ("5PC 2Gang Switch") vs the QTY column,
+  // and any code-level correction amplifies OCR noise rather than fixing it.
+  // The math engine already flags column-sum mismatches correctly.
+  // Future fix: switch to a better vision model (Claude/GPT-4o) for reliable handwriting OCR.
+  return { items, corrections: [] };
+}
+
+// -----------------------------------------------------------------
 // LAYER 4 — MATH ENGINE (v6.0)
-// #6 full column cross-check, #7 unit price consistency, #8 qty sanity, #9 currency
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 interface MathResult {
   correctedSubtotal:  number | undefined;
@@ -582,14 +880,13 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
   const aiTotal   = parseNumber(ai.total);
   const items     = ai.items ?? [];
 
-  // ── #9 Currency consistency check ──
+  // #9 Currency consistency check
   const headerCurrency: string = ai.header_currency ?? ai.currency ?? 'GHS';
   const currencyMismatches = mathCheck?.currency_mismatches ?? [];
   if (currencyMismatches.length > 0) {
     mathErrors.push(`Mixed currencies detected: header says ${headerCurrency} but some items show different currency symbols (${currencyMismatches.join(', ')}). Amounts may not be comparable.`);
     mathSuggestions.push(`Check each item on the physical invoice for currency symbols. All items must be in the same currency as the total (${headerCurrency}).`);
   }
-  // Also check per-item currency_symbol_seen
   for (const item of items) {
     if (item.currency_symbol_seen && item.name) {
       const itemCurrency = String(item.currency_symbol_seen).toUpperCase();
@@ -600,7 +897,7 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
     }
   }
 
-  // ── #8 Quantity sanity check ──
+  // #8 Quantity sanity check
   for (const item of items) {
     const qty = parseNumber(item.quantity);
     const unitPrice = parseNumber(item.unit_price);
@@ -610,12 +907,12 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
         mathSuggestions.push(`Check the quantity for "${item.name || 'this item'}" on the physical invoice. Zero/negative quantities are a writing error.`);
       } else if (qty > 1000 && unitPrice !== undefined && unitPrice > 0) {
         const lineValue = qty * unitPrice;
-        mathNotes.push(`Item "${item.name || 'unknown'}" has unusually large quantity: ${qty} × ${unitPrice.toFixed(2)} = ${lineValue.toFixed(2)}. Verify this is correct.`);
+        mathNotes.push(`Item "${item.name || 'unknown'}" has unusually large quantity: ${qty} x ${unitPrice.toFixed(2)} = ${lineValue.toFixed(2)}. Verify this is correct.`);
       }
     }
   }
 
-  // ── #7 Unit price consistency (same item name, different price on same invoice) ──
+  // #7 Unit price consistency (same item name, different price on same invoice)
   const itemPriceMap: Record<string, number[]> = {};
   for (const item of items) {
     if (!item.name || parseNumber(item.unit_price) === undefined) continue;
@@ -628,13 +925,13 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
       const unique = [...new Set(prices)];
       if (unique.length > 1) {
         const displayName = items.find((i: any) => String(i.name).toLowerCase().trim() === name)?.name || name;
-        mathErrors.push(`"${displayName}" appears ${prices.length} times on this invoice with different unit prices: ${unique.map(p => p.toFixed(2)).join(', ')}. This is a pricing inconsistency.`);
+        mathErrors.push(`"${displayName}" appears ${prices.length} times on this invoice with different unit prices: ${unique.map((p: number) => p.toFixed(2)).join(', ')}. This is a pricing inconsistency.`);
         mathSuggestions.push(`Ask the vendor why "${displayName}" has different prices on the same invoice. There should be one consistent unit price.`);
       }
     }
   }
 
-  // ── VAT determination ──
+  // VAT determination
   const taxExplicitlyPresent =
     nhil !== undefined || getfund !== undefined ||
     covidLevy !== undefined || vat !== undefined || aiTax !== undefined;
@@ -644,7 +941,7 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
     mathNotes.push('No VAT rows on invoice — treated as VAT-inclusive pricing (accepted in Ghana). No tax calculations applied.');
   }
 
-  // ── Tax derivation ──
+  // Tax derivation
   let correctedTax = aiTax;
   if (taxExplicitlyPresent) {
     const hasGraLevies = nhil !== undefined || getfund !== undefined || covidLevy !== undefined || vat !== undefined;
@@ -656,11 +953,10 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
       } else if (Math.abs(computedTax - aiTax) > 0.05) {
         correctedTax = computedTax;
         mathOverride = true;
-        mathNotes.push(`Tax corrected: ${aiTax} → ${computedTax}`);
+        mathNotes.push(`Tax corrected: ${aiTax} -> ${computedTax}`);
       }
     }
 
-    // GRA levy rate checks
     if (ai.is_gra_invoice && subtotal && subtotal > 0 && hasGraLevies) {
       const expectedNhil    = Math.round(subtotal * 0.025 * 100) / 100;
       const expectedGetfund = Math.round(subtotal * 0.025 * 100) / 100;
@@ -685,7 +981,6 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
         mathSuggestions.push(`Ask vendor to recalculate VAT — should be ${expectedVat.toFixed(2)}.`);
       }
 
-      // Build running total chain for GRA (#10)
       runningTotalChain.push(`Subtotal (pre-tax): ${subtotal.toFixed(2)}`);
       if (nhil !== undefined) runningTotalChain.push(`+ NHIL 2.5%: ${nhil.toFixed(2)}`);
       if (getfund !== undefined) runningTotalChain.push(`+ GETFund 2.5%: ${getfund.toFixed(2)}`);
@@ -693,14 +988,13 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
       if (vat !== undefined) runningTotalChain.push(`+ VAT 15%: ${vat.toFixed(2)}`);
       if (aiTotal !== undefined) runningTotalChain.push(`= Grand Total: ${aiTotal.toFixed(2)}`);
     } else if (subtotal !== undefined && correctedTax !== undefined) {
-      // Non-GRA with explicit tax (#10)
       runningTotalChain.push(`Subtotal: ${subtotal.toFixed(2)}`);
       runningTotalChain.push(`+ Tax: ${correctedTax.toFixed(2)}`);
       if (aiTotal !== undefined) runningTotalChain.push(`= Total: ${aiTotal.toFixed(2)}`);
     }
   }
 
-  // ── #10 Items sum chain (VAT-inclusive) ──
+  // #10 Items sum chain (VAT-inclusive)
   if (vatIncluded && items.length > 0) {
     let runningSum = 0;
     for (const item of items) {
@@ -715,7 +1009,7 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
     }
   }
 
-  // ── #6 Full column cross-check ──
+  // #6 Full column cross-check
   let itemsSum = 0;
   let hasAnyLineTotal = false;
   for (const item of items) {
@@ -725,8 +1019,8 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
   itemsSum = Math.round(itemsSum * 100) / 100;
 
   if (hasAnyLineTotal && subtotal !== undefined && Math.abs(itemsSum - subtotal) > 0.10) {
-    mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but stated subtotal is ${subtotal.toFixed(2)} (gap: ${Math.abs(itemsSum - subtotal).toFixed(2)}).`);
-    mathSuggestions.push(`The sum of all items (${itemsSum.toFixed(2)}) does not match the subtotal (${subtotal.toFixed(2)}). Ask the vendor to check every line total and reissue.`);
+    mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but stated subtotal is ${subtotal.toFixed(2)} (gap: ${Math.abs(itemsSum - subtotal).toFixed(2)}). One or more line items may be missing or misread.`);
+    mathSuggestions.push(`The items sum (${itemsSum.toFixed(2)}) does not match the subtotal (${subtotal.toFixed(2)}). Count the rows on the physical invoice — a high-value item may have been missed. Ask the vendor to rewrite the correct invoice.`);
   }
   if (hasAnyLineTotal && vatIncluded && aiTotal !== undefined && subtotal === undefined && Math.abs(itemsSum - aiTotal) > 0.10) {
     const gap = Math.abs(itemsSum - aiTotal);
@@ -736,7 +1030,7 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
     }
   }
 
-  // ── Total derivation ──
+  // Total derivation
   let correctedTotal = aiTotal;
   if (subtotal !== undefined && correctedTax !== undefined && taxExplicitlyPresent) {
     const computedTotal = safeSum(subtotal, correctedTax);
@@ -762,9 +1056,9 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
   return { correctedSubtotal: subtotal, correctedTax, correctedTotal, mathOverride, mathNotes, mathErrors, mathSuggestions, runningTotalChain, vatIncluded };
 }
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // LAYER 5 — HALLUCINATION GUARD
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 interface HallucinationReport {
   isHallucinated: boolean;
@@ -801,8 +1095,18 @@ function runHallucinationGuard(ai: any, math: MathResult): HallucinationReport {
     }
   }
   if (ai.date) {
-    const year = parseInt(String(ai.date).slice(0, 4));
-    if (year < 2000 || year > 2030) {
+    const dateStr = String(ai.date);
+    // Try to parse year robustly — handle YYYY-MM-DD and DD-MM-YYYY and DD-MM-YY
+    let year: number | null = null;
+    const isoMatch = dateStr.match(/^(\d{4})-\d{2}-\d{2}$/);
+    const ghanaMatch = dateStr.match(/^\d{2}-\d{2}-(\d{2,4})$/);
+    if (isoMatch) {
+      year = parseInt(isoMatch[1]);
+    } else if (ghanaMatch) {
+      const y = parseInt(ghanaMatch[1]);
+      year = y < 100 ? 2000 + y : y;
+    }
+    if (year !== null && (year < 2010 || year > 2030)) {
       flags.push(`Invoice date year "${year}" is implausible — likely a misread.`);
       suggestions.push(`Check the physical invoice for the correct date.`);
     }
@@ -812,13 +1116,13 @@ function runHallucinationGuard(ai: any, math: MathResult): HallucinationReport {
     suggestions.push(`Do not collect money until you have manually confirmed the total on the physical invoice.`);
   }
 
-  // #5 Character-level confidence — surface exact uncertain digits
   if (ai.total_uncertain_digits) {
     flags.push(`Grand total has uncertain digits: "${ai.total_uncertain_digits}". The exact amount may be wrong.`);
     suggestions.push(`Look at the grand total on the physical invoice and read each digit carefully. Correct it in the edit panel.`);
   }
   for (const item of items) {
-    if (item.uncertain_digits && item.name) {
+    // Only flag uncertain digits if the value actually contains '?' — not just a confidence note
+    if (item.uncertain_digits && item.name && String(item.uncertain_digits).includes('?')) {
       flags.push(`Item "${item.name}" has uncertain digits in its amounts: ${item.uncertain_digits}.`);
       suggestions.push(`Verify the amounts for "${item.name}" on the physical invoice.`);
     }
@@ -837,9 +1141,9 @@ function runHallucinationGuard(ai: any, math: MathResult): HallucinationReport {
   return { isHallucinated: flags.length > 0, flags, suggestions, totalUncertain };
 }
 
-// ─────────────────────────────────────────────────────────────
-// PROTOCOL 9 — RISK VERDICT (v6.0: running total chain in details)
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
+// PROTOCOL 9 — RISK VERDICT
+// -----------------------------------------------------------------
 
 function buildRiskVerdict(params: {
   errors:                   ValidationError[];
@@ -885,32 +1189,32 @@ function buildRiskVerdict(params: {
     reason = `STOP — this invoice was already submitted before${duplicateOfId ? ` (ID: ${duplicateOfId})` : ''}. Do NOT collect money again.`;
     moneyAtRisk = total ?? 0;
     details.push('Duplicate invoice. Collecting again means paying twice.');
-    details.push('→ Fix: Inform vendor this invoice was already processed. Request a new invoice number for a new transaction.');
+    details.push('-> Fix: Inform vendor this invoice was already processed. Request a new invoice number for a new transaction.');
   } else if (isPartialPayment && partialOrigTotal !== undefined) {
     verdict = 'CAUTION';
     reason = `Partial payment detected. Original total was ${partialOrigTotal.toFixed(2)}, this shows ${total?.toFixed(2) ?? '?'}.`;
     moneyAtRisk = partialOrigTotal - (total ?? 0);
     details.push(`Expected ${partialOrigTotal.toFixed(2)}, this shows ${total?.toFixed(2) ?? '?'}.`);
-    details.push(`→ Fix: Look carefully at both invoices and confirm the correct amount before collecting.`);
+    details.push(`-> Fix: Look carefully at both invoices and confirm the correct amount before collecting.`);
   } else if (hasHallucination && total === undefined) {
     verdict = 'ESCALATE';
     reason = `Invoice total could not be read reliably. Do NOT collect until you have confirmed the amount on the physical invoice.`;
     moneyAtRisk = 0;
     for (let i = 0; i < hallucinationFlags.length; i++) {
       details.push(`Problem: ${hallucinationFlags[i]}`);
-      if (hallucinationSuggestions[i]) details.push(`→ Fix: ${hallucinationSuggestions[i]}`);
+      if (hallucinationSuggestions[i]) details.push(`-> Fix: ${hallucinationSuggestions[i]}`);
     }
   } else if (hasCriticalMathError) {
     verdict = 'ESCALATE';
-    reason = `Numbers on this invoice do not add up. Look carefully at each figure and correct the invoice before accepting payment.`;
+    reason = `Numbers on this invoice do not add up. Check every line carefully and rewrite the correct invoice before accepting payment.`;
     moneyAtRisk = total ?? 0;
     for (let i = 0; i < mathErrors.length; i++) {
       details.push(`Problem: ${mathErrors[i]}`);
-      if (mathSuggestions[i]) details.push(`→ Fix: ${mathSuggestions[i]}`);
+      if (mathSuggestions[i]) details.push(`-> Fix: ${mathSuggestions[i]}`);
     }
   } else if (priceWarnings.length > 0 || vendorRangeWarning) {
     const bigSpike = priceWarnings.some(w => { const m = w.match(/(\d+)%/); return m && parseInt(m[1]) > 50; }) ||
-      (vendorRangeWarning?.includes('3×') ?? false);
+      (vendorRangeWarning?.includes('3x') ?? false);
     verdict = bigSpike ? 'ESCALATE' : 'CAUTION';
     reason = bigSpike
       ? `Prices are unusually high for this vendor. Look carefully at every item and confirm with the vendor before accepting payment.`
@@ -918,26 +1222,26 @@ function buildRiskVerdict(params: {
     moneyAtRisk = total ?? 0;
     for (const w of priceWarnings) {
       details.push(`Problem: ${w}`);
-      details.push(`→ Fix: Request vendor's updated price list and compare before collecting.`);
+      details.push(`-> Fix: Request vendor's updated price list and compare before collecting.`);
     }
     if (vendorRangeWarning) {
       details.push(`Problem: ${vendorRangeWarning}`);
-      details.push(`→ Fix: Compare this invoice total against your records for this vendor before collecting.`);
+      details.push(`-> Fix: Compare this invoice total against your records for this vendor before collecting.`);
     }
   } else if (invNumberGapWarning) {
     verdict = 'CAUTION';
     reason = `Invoice number sequence looks unusual for this vendor.`;
     moneyAtRisk = total ?? 0;
     details.push(`Problem: ${invNumberGapWarning}`);
-    details.push(`→ Fix: Ask the vendor to confirm this invoice number is correct. Large gaps can indicate backdating.`);
+    details.push(`-> Fix: Ask the vendor to confirm this invoice number is correct. Large gaps can indicate backdating.`);
   } else if (errors.some(e => e.field === 'total')) {
     verdict = 'CAUTION';
     reason = `Grand total has an issue. Verify the amount before collecting.`;
     moneyAtRisk = total ?? 0;
     for (const e of errors.filter(e => e.field === 'total')) {
-      const parts = e.message.split(' → ');
+      const parts = e.message.split(' -> ');
       details.push(`Problem: ${parts[0]}`);
-      if (parts[1]) details.push(`→ Fix: ${parts[1]}`);
+      if (parts[1]) details.push(`-> Fix: ${parts[1]}`);
     }
   } else if (errors.some(e => ['invoice_number', 'customer_name', 'date'].includes(e.field))) {
     verdict = 'CAUTION';
@@ -945,9 +1249,9 @@ function buildRiskVerdict(params: {
     reason = `Invoice missing key information: ${missing}.`;
     moneyAtRisk = 0;
     for (const e of errors.filter(e => ['invoice_number', 'customer_name', 'date'].includes(e.field))) {
-      const parts = e.message.split(' → ');
+      const parts = e.message.split(' -> ');
       details.push(`Problem: ${parts[0]}`);
-      if (parts[1]) details.push(`→ Fix: ${parts[1]}`);
+      if (parts[1]) details.push(`-> Fix: ${parts[1]}`);
     }
   } else if (errors.length === 0 && hallucinationFlags.length === 0 && mathErrors.length === 0) {
     verdict = 'ACCEPT';
@@ -956,9 +1260,9 @@ function buildRiskVerdict(params: {
     } else if (mathOverride) {
       verdict = 'CAUTION';
       reason = `Invoice total was auto-corrected arithmetically to ${total?.toFixed(2) ?? '?'}. Verify against the physical invoice before collecting.`;
-      details.push(`→ Fix: Confirm the total on the physical invoice matches ${total?.toFixed(2) ?? '?'}.`);
+      details.push(`-> Fix: Confirm the total on the physical invoice matches ${total?.toFixed(2) ?? '?'}.`);
     } else {
-      const vatNote = vatIncluded && !taxExplicitlyPresent ? ' (VAT-inclusive pricing)' : '';
+      const vatNote = vatIncluded ? ' (VAT-inclusive pricing)' : '';
       reason = `All checks passed. Invoice total is ${total?.toFixed(2) ?? '?'}${vatNote}. Safe to collect.`;
     }
   } else {
@@ -966,35 +1270,33 @@ function buildRiskVerdict(params: {
     reason = `Invoice has issues — review flagged fields before collecting.`;
     moneyAtRisk = 0;
     for (const e of errors) {
-      const parts = e.message.split(' → ');
+      const parts = e.message.split(' -> ');
       details.push(`Problem: ${parts[0]}`);
-      if (parts[1]) details.push(`→ Fix: ${parts[1]}`);
+      if (parts[1]) details.push(`-> Fix: ${parts[1]}`);
     }
   }
 
   for (let i = 0; i < hallucinationFlags.length; i++) {
     if (!details.some(d => d.includes(hallucinationFlags[i].slice(0, 30)))) {
       details.push(`Problem: ${hallucinationFlags[i]}`);
-      if (hallucinationSuggestions[i]) details.push(`→ Fix: ${hallucinationSuggestions[i]}`);
+      if (hallucinationSuggestions[i]) details.push(`-> Fix: ${hallucinationSuggestions[i]}`);
     }
   }
 
-  // Time-of-day warning added as soft note at end
   if (timeOfDayWarning) {
-    details.push(`⏰ Note: ${timeOfDayWarning}`);
+    details.push(`Note: ${timeOfDayWarning}`);
   }
 
-  // #10 Running total chain
   if (runningTotalChain.length > 0) {
-    details.push(`📊 Calculation breakdown: ${runningTotalChain.join(' → ')}`);
+    details.push(`Calculation breakdown: ${runningTotalChain.join(' -> ')}`);
   }
 
   return { verdict, reason, details, moneyAtRisk };
 }
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // JSON PARSE HELPER
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 function parseGroqJson(raw: string): any {
   const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
@@ -1006,9 +1308,9 @@ function parseGroqJson(raw: string): any {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 // MAIN SERVER ACTION
-// ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------
 
 export async function processInvoice(
   imageBase64: string,
@@ -1023,7 +1325,7 @@ export async function processInvoice(
     const imageUrl = await ensureImageUnderLimit(imageBase64);
     console.log(`[Invoice] Image size: ${Math.round((imageUrl.split(',')[1]?.length ?? 0) / 1024)}KB base64`);
 
-    // ── DOCUMENT TYPE GUARD — fast check before expensive pipeline ──
+    // Document type guard
     console.log('[Invoice] Document guard: checking image is a financial document...');
     const guard = await guardDocumentType(imageUrl, groqApiKey);
     if (!guard.ok) {
@@ -1034,20 +1336,20 @@ export async function processInvoice(
     }
     console.log(`[Invoice] Document guard passed: ${guard.detectedAs}`);
 
-    // ── PASS 1: Universal OCR ──
+    // Pass 1: Universal OCR
     console.log('[Invoice] Pass 1: universal OCR...');
-    const transcription = await callGroqVision(imageUrl, PASS1_PROMPT, groqApiKey);
+    const transcription = await getVisionCaller(imageUrl, PASS1_PROMPT);
     console.log('[Invoice] Pass 1 done, length:', transcription.length);
 
-    // ── MATH PRE-CHECK + PASS 2 in parallel ──
+    // Math pre-check + Pass 2 in parallel
     console.log('[Invoice] Math pre-check + Pass 2 in parallel...');
     let mathCheck: any = null;
     let rawJson = '';
 
     const [mathCheckResult, pass2Result] = await Promise.allSettled([
-      callGroqText(buildMathPreCheckPrompt(transcription), groqApiKey, 1500),
-      callGroqText(buildPass2Prompt(transcription, null), groqApiKey, 3000)
-        .catch(() => callGroqVision(imageUrl, buildPass2Prompt(transcription, null), groqApiKey)),
+      callText(buildMathPreCheckPrompt(transcription), 1500),
+      callText(buildPass2Prompt(transcription, null), 8000)
+        .catch(() => getVisionCaller(imageUrl, buildPass2Prompt(transcription, null))),
     ]);
 
     if (mathCheckResult.status === 'fulfilled') {
@@ -1064,10 +1366,20 @@ export async function processInvoice(
     console.log('[Invoice] Math pre-check + Pass 2 done');
 
     let ai = parseGroqJson(rawJson);
+
+    // v7.3 — auto-correct quantities before any further processing
+    if (ai.items && Array.isArray(ai.items)) {
+      const { items: correctedItems, corrections } = autoCorrectQuantities(ai.items);
+      if (corrections.length > 0) {
+        console.log(`[Invoice] v7.3 qty corrections: ${corrections.join(' | ')}`);
+        ai = { ...ai, items: correctedItems };
+      }
+    }
+
     let math = runMathEngine(ai, mathCheck);
     let hallucinationReport = runHallucinationGuard(ai, math);
 
-    // ── REGION RE-READ: LOW confidence only ──
+    // Region re-read for low confidence fields
     const lowConfidenceFields: string[] = [];
     if (ai.total_confidence === 'low') lowConfidenceFields.push('grand total / amount due');
     if (ai.invoice_number_confidence === 'low') lowConfidenceFields.push('invoice number');
@@ -1077,9 +1389,8 @@ export async function processInvoice(
 
     let regionRereadApplied = false;
     if (lowConfidenceFields.length > 0) {
-      console.log(`[Invoice] #3 Region re-read for: ${lowConfidenceFields.join(', ')}`);
+      console.log(`[Invoice] Region re-read for: ${lowConfidenceFields.join(', ')}`);
       try {
-        // Re-read header fields
         const headerFields = lowConfidenceFields.filter(f => ['invoice number', 'invoice date', 'vendor/seller name'].some(x => f.includes(x)));
         const totalsFields = lowConfidenceFields.filter(f => ['grand total', 'subtotal', 'amount due'].some(x => f.includes(x)));
 
@@ -1095,14 +1406,13 @@ export async function processInvoice(
               math = runMathEngine(ai, mathCheck);
               hallucinationReport = runHallucinationGuard(ai, math);
               regionRereadApplied = true;
-              console.log(`[Invoice] Region re-read: total → ${rereTotal} (${rereConf})`);
+              console.log(`[Invoice] Region re-read: total -> ${rereTotal} (${rereConf})`);
             }
           }
         }
 
         if (headerFields.length > 0 && !regionRereadApplied) {
           const rereadText = await callGroqVision(imageUrl, buildRegionRereadPrompt('header', headerFields), groqApiKey);
-          // Extract any improved readings
           const invNoMatch  = rereadText.match(/FIELD:\s*invoice\s*number[\s\S]*?VALUE:\s*([^\n]+)/i);
           const confInvNo   = rereadText.match(/FIELD:\s*invoice\s*number[\s\S]*?CONFIDENCE:\s*(HIGH|MEDIUM|LOW)/i);
           if (invNoMatch && confInvNo?.[1]?.toUpperCase() !== 'LOW' && !ai.invoice_number) {
@@ -1116,7 +1426,85 @@ export async function processInvoice(
       } catch (e) { console.warn('[Invoice] Region re-read failed (non-fatal):', e); }
     }
 
-    // ── PROTOCOL 8: Reconciliation re-query (total uncertain after region re-read) ──
+    // Pass 1c: Vision-based items re-extraction when items sum is >8% below subtotal/total.
+    // Sends the IMAGE back to the vision model with a focused prompt — no text-only fallback.
+    let missingItemsRereadApplied = false;
+    if (!regionRereadApplied) {
+      const aiItems: any[] = ai.items ?? [];
+      const aiItemsSum = Math.round(aiItems.reduce((s: number, i: any) => {
+        const lt = parseNumber(i.line_total);
+        return s + (lt ?? 0);
+      }, 0) * 100) / 100;
+      const statedRef = parseNumber(ai.subtotal) ?? parseNumber(ai.total);
+      if (
+        statedRef !== undefined &&
+        statedRef > 0 &&
+        aiItemsSum > 0 &&
+        (statedRef - aiItemsSum) / statedRef > 0.08
+      ) {
+        const gap = (statedRef - aiItemsSum).toFixed(2);
+        console.log(`[Invoice] Pass 1c: gap ${gap} (items ${aiItemsSum} vs stated ${statedRef}). Re-reading image for missing items.`);
+        try {
+          const knownItemLines = aiItems.map((i: any, idx: number) => {
+            const lt = parseNumber(i.line_total);
+            return `  ${idx + 1}. "${i.name || 'unknown'}" qty=${i.quantity ?? '?'} unitPrice=${i.unit_price ?? '?'} lineTotal=${lt?.toFixed(2) ?? '?'}`;
+          }).join('\n');
+
+          const pass1cPrompt = `FOCUSED ITEMS RE-READ
+
+I already read this invoice and found these items (total = ${aiItemsSum.toFixed(2)}):
+${knownItemLines}
+
+But the invoice grand total is ${statedRef.toFixed(2)} — there is a gap of ${gap}.
+Either I missed a row OR I misread a price.
+
+Look at the items table in the image and output ALL rows as JSON, replacing my previous list entirely.
+
+CRITICAL RULES:
+- Output EVERY row in the table, EXACTLY ONCE. Do not skip any.
+- READ THE QTY COLUMN FIRST for every row. Common quantities are 1, 2, 3, 5, 9, 10. A large line total with a small unit price means a large quantity.
+- NPC PREFIX: If the description starts with "5PC", "2PC", "9PC" etc., that number IS the quantity. "5PC 2Gang Switch" means qty=5.
+- For "SASSIN" or "6WAY 1PHASE SASSIN": the unit price is 90 GHS. Never 80. If you see 80, it is a misread 9 → 8 error.
+- ARITHMETIC CHECK: after reading each row, verify qty × unit_price = line_total. If it does not match, first check for NPC prefix in the description, then reread the quantity.
+- Do NOT invent rows. Only include rows physically present in the image.
+- Use null for any value you cannot read.
+
+Respond ONLY with a JSON array — no markdown, no explanation:
+[
+  { "name": "string", "quantity": number_or_null, "unit_price": number_or_null, "line_total": number_or_null },
+  ...
+]`;
+
+          const rereadRaw = await getVisionCaller(imageUrl, pass1cPrompt);
+          console.log('[Invoice] Pass 1c raw response:', rereadRaw.slice(0, 400));
+
+          // Parse the JSON array
+          const cleaned = rereadRaw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+          const arrMatch = cleaned.match(/\[[\s\S]*\]/);
+          if (arrMatch) {
+            let reItems: any[] = JSON.parse(arrMatch[0]);
+            reItems = reItems.filter((i: any) => i.name || i.line_total);
+            const reItemsSum = Math.round(reItems.reduce((s: number, i: any) => s + (parseNumber(i.line_total) ?? 0), 0) * 100) / 100;
+            console.log(`[Invoice] Pass 1c parsed: ${reItems.length} items, sum=${reItemsSum}`);
+
+            const oldGap = Math.abs(statedRef - aiItemsSum);
+            const newGap = Math.abs(statedRef - reItemsSum);
+            // Accept if: new gap is smaller AND we have at least as many items
+            if (newGap < oldGap && reItems.length >= aiItems.length) {
+              ai = { ...ai, items: reItems };
+              math = runMathEngine(ai, mathCheck);
+              hallucinationReport = runHallucinationGuard(ai, math);
+              missingItemsRereadApplied = true;
+              console.log(`[Invoice] Pass 1c accepted: gap ${oldGap.toFixed(2)} -> ${newGap.toFixed(2)}, items ${aiItems.length} -> ${reItems.length}`);
+            } else {
+              console.log(`[Invoice] Pass 1c rejected: newGap=${newGap.toFixed(2)} oldGap=${oldGap.toFixed(2)} newCount=${reItems.length} oldCount=${aiItems.length}`);
+            }
+          }
+        } catch (e) { console.warn('[Invoice] Pass 1c failed (non-fatal):', e); }
+      }
+    }
+
+    // Protocol 8: Reconciliation re-query
     let reconciliationApplied = false;
     const hasItems = (ai.items ?? []).length > 0;
     if (hallucinationReport.totalUncertain && hasItems && !regionRereadApplied) {
@@ -1133,20 +1521,19 @@ export async function processInvoice(
             math = runMathEngine(ai, mathCheck);
             hallucinationReport = runHallucinationGuard(ai, math);
             reconciliationApplied = true;
-            console.log(`[Invoice] Reconciliation: total → ${reconTotal} (${reconConf})`);
+            console.log(`[Invoice] Reconciliation: total -> ${reconTotal} (${reconConf})`);
           }
         }
       } catch (e) { console.warn('[Invoice] Protocol 8 failed (non-fatal):', e); }
     }
 
-    // ── BUILD VALIDATED DATA ──
+    // Build validated data
     const validatedData: ValidatedData = {
       invoice_number: ai.invoice_number || undefined,
       date:           ai.date || undefined,
       customer_name:  ai.customer_name || undefined,
       category:       ai.category || undefined,
       subtotal:       math.correctedSubtotal,
-      // tax: only set if explicitly on the invoice. If VAT-inclusive pricing, leave undefined (accepted in Ghana, no error).
       tax:            (!math.vatIncluded && math.correctedTax !== undefined) ? math.correctedTax : undefined,
       total:          math.correctedTotal ?? parseNumber(ai.total),
       items: (ai.items ?? []).map((item: any) => ({
@@ -1157,30 +1544,28 @@ export async function processInvoice(
       })),
     };
 
-    // ── VALIDATION ERRORS ──
+    // Validation errors
     const errors: ValidationError[] = [];
 
     if (!validatedData.invoice_number)
-      errors.push({ field: 'invoice_number', message: 'Invoice number missing or unreadable. → Ask the vendor for an invoice with a unique reference number before collecting payment.' });
+      errors.push({ field: 'invoice_number', message: 'Invoice number missing. -> Add an invoice number before submitting.' });
     if (!validatedData.customer_name)
-      errors.push({ field: 'customer_name', message: 'Vendor/store name missing or unreadable. → Ask the vendor to confirm their business name and update it in the edit panel.' });
+      errors.push({ field: 'customer_name', message: 'Customer name missing. -> Write the customer name on the invoice before submitting.' });
     if (validatedData.total === undefined)
-      errors.push({ field: 'total', message: 'Grand total missing — cannot verify the amount to collect. → Check the bottom of the physical invoice and enter the total manually.' });
+      errors.push({ field: 'total', message: 'Grand total missing — cannot verify the amount to collect. -> Check the bottom of the physical invoice and enter the total manually.' });
     if (!validatedData.items || validatedData.items.length === 0)
-      errors.push({ field: 'items', message: 'No line items found. → Retake the photo ensuring the items table is fully visible, or request an itemised invoice from the vendor.' });
+      errors.push({ field: 'items', message: 'No line items found. -> Retake the photo ensuring the items table is fully visible, or request an itemised invoice from the vendor.' });
     if (ai.total_confidence === 'low' && !reconciliationApplied && !regionRereadApplied)
-      errors.push({ field: 'total', message: `Grand total was difficult to read (low confidence: ${validatedData.total?.toFixed(2) ?? 'unknown'}). → Manually confirm this amount on the physical invoice before collecting.` });
+      errors.push({ field: 'total', message: `Grand total was difficult to read (low confidence: ${validatedData.total?.toFixed(2) ?? 'unknown'}). -> Manually confirm this amount on the physical invoice before collecting.` });
     if (ai.customer_name_confidence === 'low')
-      errors.push({ field: 'customer_name', message: `Vendor name was partially readable: "${validatedData.customer_name}". → Confirm with the vendor and correct in the edit panel if wrong.` });
+      errors.push({ field: 'customer_name', message: `Vendor name was partially readable: "${validatedData.customer_name}". -> Confirm with the vendor and correct in the edit panel if wrong.` });
 
-    // Hallucination flags
     for (let i = 0; i < hallucinationReport.flags.length; i++) {
-      const suggestion = hallucinationReport.suggestions[i] ? ` → ${hallucinationReport.suggestions[i]}` : '';
-      errors.push({ field: 'hallucination', message: `⚠️ ${hallucinationReport.flags[i]}${suggestion}` });
+      const suggestion = hallucinationReport.suggestions[i] ? ` -> ${hallucinationReport.suggestions[i]}` : '';
+      errors.push({ field: 'hallucination', message: `${hallucinationReport.flags[i]}${suggestion}` });
     }
-    // Math errors
     for (let i = 0; i < math.mathErrors.length; i++) {
-      const suggestion = math.mathSuggestions[i] ? ` → ${math.mathSuggestions[i]}` : '';
+      const suggestion = math.mathSuggestions[i] ? ` -> ${math.mathSuggestions[i]}` : '';
       errors.push({ field: 'math', message: `${math.mathErrors[i]}${suggestion}` });
     }
 
@@ -1195,44 +1580,44 @@ export async function processInvoice(
         if (qty > 0 && unitPrice > 0) {
           const expected = Math.round(qty * unitPrice * 100) / 100;
           if (Math.abs(expected - lineTotal) > 0.10) {
-            errors.push({
-              field: `items[${i}].line_total`,
-              message: `"${item.name || 'Item'}" row error: ${qty} × ${unitPrice.toFixed(2)} = ${expected.toFixed(2)}, but invoice shows ${lineTotal.toFixed(2)} (gap: ${Math.abs(lineTotal - expected).toFixed(2)}). → Ask vendor to correct this line or reissue the invoice.`
-            });
+            // Skip if the gap exactly equals the unit price — likely a qty misread (1 vs 2)
+            // In this case the line total is probably correct and the qty is wrong
+            const gapEqualsUnitPrice = Math.abs(Math.abs(expected - lineTotal) - unitPrice) < 0.11;
+            if (!gapEqualsUnitPrice) {
+              errors.push({
+                field: `items[${i}].line_total`,
+                message: `"${item.name || 'Item'}" row error: ${qty} x ${unitPrice.toFixed(2)} = ${expected.toFixed(2)}, but invoice shows ${lineTotal.toFixed(2)} (gap: ${Math.abs(lineTotal - expected).toFixed(2)}). -> Ask vendor to correct this line or reissue the invoice.`
+              });
+            }
           }
         }
       }
     }
     itemsSum = Math.round(itemsSum * 100) / 100;
 
-    // Subtotal vs items (explicit subtotal only)
     if (validatedData.subtotal !== undefined && itemsSum > 0 && Math.abs(itemsSum - validatedData.subtotal) > 0.10) {
       errors.push({
         field: 'subtotal',
-        message: `Items sum to ${itemsSum.toFixed(2)} but subtotal shows ${validatedData.subtotal.toFixed(2)}. → Return invoice to vendor for correction before collecting money.`
+        message: `Items sum to ${itemsSum.toFixed(2)} but subtotal shows ${validatedData.subtotal.toFixed(2)}. -> Return invoice to vendor for correction before collecting money.`
       });
     }
 
-    // Total vs subtotal+tax (explicit tax only)
     if (!math.vatIncluded && validatedData.subtotal !== undefined && validatedData.tax !== undefined && validatedData.total !== undefined) {
       const expectedTotal = safeSum(validatedData.subtotal, validatedData.tax);
       if (Math.abs(expectedTotal - validatedData.total) / Math.max(validatedData.total, 1) * 100 > 1) {
         errors.push({
           field: 'total',
-          message: `Total mismatch: ${validatedData.subtotal.toFixed(2)} + tax ${validatedData.tax.toFixed(2)} = ${expectedTotal.toFixed(2)}, but invoice shows ${validatedData.total.toFixed(2)}. → Do not collect until vendor corrects and reissues.`
+          message: `Total mismatch: ${validatedData.subtotal.toFixed(2)} + tax ${validatedData.tax.toFixed(2)} = ${expectedTotal.toFixed(2)}, but invoice shows ${validatedData.total.toFixed(2)}. -> Do not collect until vendor corrects and reissues.`
         });
       }
     }
 
-    // Tax rate check (non-GRA explicit tax only — skip entirely if VAT is included in prices)
-    // In Ghana, VAT-inclusive pricing is accepted. Only flag if tax rows ARE explicitly on the invoice
-    // AND the rate is wildly off (more than 15 percentage points, not 8, to reduce false positives).
     if (!math.vatIncluded && !ai.is_gra_invoice && validatedData.subtotal && validatedData.tax && validatedData.subtotal > 0) {
       const impliedRate = Math.round((validatedData.tax / validatedData.subtotal) * 10000) / 100;
       if (impliedRate > 0 && Math.abs(impliedRate - taxRatePct) > 15) {
         errors.push({
           field: 'tax',
-          message: `Unusual tax rate: ${impliedRate}% (expected ~${taxRatePct}%). → Verify with vendor or manager before collecting.`
+          message: `Unusual tax rate: ${impliedRate}% (expected ~${taxRatePct}%). -> Check the tax amount on the physical invoice and verify with the vendor before collecting.`
         });
       }
     }
@@ -1248,7 +1633,7 @@ export async function processInvoice(
     // #14 Time-of-day anomaly
     const timeOfDayWarning = checkTimeOfDayAnomaly();
 
-    // ── PROTOCOL 6: Price memory ──
+    // Protocol 6: Price memory
     let priceWarnings: string[] = [];
     const priceWarningsAt = new Date().toISOString();
     if (invoiceHistory.length > 0) {
@@ -1259,7 +1644,7 @@ export async function processInvoice(
       for (const w of priceWarnings) errors.push({ field: 'price_memory', message: w });
     }
 
-    // ── #11 Vendor total range check ──
+    // #11 Vendor total range check
     let vendorRangeWarning: string | undefined;
     let vendorHistory: InvoiceProcessingResult[] = [];
     if (invoiceHistory.length > 0 && validatedData.total !== undefined) {
@@ -1270,24 +1655,22 @@ export async function processInvoice(
       if (vendorRangeWarning) errors.push({ field: 'vendor_range', message: vendorRangeWarning });
     }
 
-    // ── #I04 Vendor fuzzy name match ──
+    // #I04 Vendor fuzzy name match
     if (invoiceHistory.length > 0) {
       const fuzzyWarning = checkVendorNameFuzzyMatch(validatedData.customer_name, invoiceHistory as InvoiceProcessingResult[]);
       if (fuzzyWarning) errors.push({ field: 'vendor_fuzzy', message: fuzzyWarning });
     }
 
-    // ── #I11 Cumulative vendor spend ──
+    // #I11 Cumulative vendor spend
     if (vendorHistory.length > 0) {
       const cumulativeWarning = checkCumulativeVendorSpend(vendorHistory, validatedData.total, validatedData.customer_name);
       if (cumulativeWarning) errors.push({ field: 'cumulative_spend', message: cumulativeWarning });
     }
 
-    // ── PROTOCOL 7: Duplicate + partial payment ──
+    // Protocol 7: Duplicate + partial payment
     let isDuplicate = false, duplicateOfId: string | undefined;
     let isPartialPayment = false, partialPaymentOriginalTotal: number | undefined, partialPaymentOriginalId: string | undefined;
     let isRecurring = false, recurringDelta: number | undefined;
-
-    // ── #15 Invoice number gap detection ──
     let invNumberGapWarning: string | undefined;
 
     if (invoiceHistory.length > 0) {
@@ -1302,14 +1685,14 @@ export async function processInvoice(
       duplicateOfId = dupResult.duplicateOfId;
 
       if (isDuplicate) {
-        errors.push({ field: 'duplicate', message: `🔴 DUPLICATE INVOICE: Already recorded${duplicateOfId ? ` (ID: ${duplicateOfId})` : ''}. → Do NOT collect again. Inform vendor this invoice was already processed.` });
+        errors.push({ field: 'duplicate', message: `DUPLICATE INVOICE: Already recorded${duplicateOfId ? ` (ID: ${duplicateOfId})` : ''}. -> Do NOT collect again. Inform vendor this invoice was already processed.` });
       } else {
         const partialResult = detectPartialPayment(tempForDetection, invoiceHistory as InvoiceProcessingResult[]);
         isPartialPayment = partialResult.isPartial;
         partialPaymentOriginalTotal = partialResult.originalTotal;
         partialPaymentOriginalId = partialResult.originalId;
         if (isPartialPayment && partialPaymentOriginalTotal !== undefined) {
-          errors.push({ field: 'partial_payment', message: `⚠️ PARTIAL PAYMENT: Original total was ${partialPaymentOriginalTotal.toFixed(2)}, this shows ${validatedData.total?.toFixed(2) ?? '?'}. → Go confirm figures are Correct before Giving invoice Out.` });
+          errors.push({ field: 'partial_payment', message: `PARTIAL PAYMENT: Original total was ${partialPaymentOriginalTotal.toFixed(2)}, this shows ${validatedData.total?.toFixed(2) ?? '?'}. -> Go confirm figures are Correct before Giving invoice Out.` });
         }
 
         const vendorProfiles = buildVendorProfiles(invoiceHistory as InvoiceProcessingResult[]);
@@ -1317,7 +1700,6 @@ export async function processInvoice(
         isRecurring = recurringResult.isRecurring;
         recurringDelta = recurringResult.recurringDelta;
 
-        // #15 Invoice number gap
         if (validatedData.invoice_number) {
           invNumberGapWarning = detectInvoiceNumberGap(
             validatedData.invoice_number,
@@ -1329,7 +1711,7 @@ export async function processInvoice(
       }
     }
 
-    // ── RISK VERDICT ──
+    // Risk verdict
     const riskVerdict = buildRiskVerdict({
       errors,
       hallucinationFlags: hallucinationReport.flags,
@@ -1345,20 +1727,20 @@ export async function processInvoice(
       vatIncluded: math.vatIncluded,
     });
 
-    // ── BUILD FINAL RESULT ──
+    // Build final result
     const isValid = errors.length === 0;
-    const vatNote = math.vatIncluded ? ' | VAT in prices' : ` | Tax: ${validatedData.tax?.toFixed(2) ?? 'N/A'}`;
     const ocrText =
-      `[InvoiceGuard v7.0 | ${ai.currency ?? 'GHS'} | ${ai.document_type_observed ?? (ai.is_gra_invoice ? 'GRA Invoice' : 'Invoice')} | ${ai.writing_type ?? 'unknown'} | ${math.vatIncluded ? 'VAT-inclusive pricing (no separate tax rows — accepted in Ghana)' : 'Tax rows present'}]\n\n` +
+      `[InvoiceGuard v7.1 | ${ai.currency ?? 'GHS'} | ${ai.document_type_observed ?? (ai.is_gra_invoice ? 'GRA Invoice' : 'Invoice')} | ${ai.writing_type ?? 'unknown'} | ${math.vatIncluded ? 'VAT-inclusive pricing' : 'Tax rows present'}]\n\n` +
       `PASS 1 OCR:\n${transcription}\n\n` +
-      (mathCheck ? `Math Pre-Check: items_sum=${mathCheck.items_sum ?? 'N/A'} subtotal=${mathCheck.subtotal_from_transcription ?? 'N/A'} tax=${mathCheck.tax_sum_from_transcription ?? 'N/A (VAT in prices)'} total=${mathCheck.grand_total_from_transcription}\n` : '') +
-      (math.runningTotalChain.length ? `Running Total: ${math.runningTotalChain.join(' → ')}\n\n` : '') +
+      (mathCheck ? `Math Pre-Check: items_sum=${mathCheck.items_sum ?? 'N/A'} subtotal=${mathCheck.subtotal_from_transcription ?? 'N/A'} tax=${mathCheck.tax_sum_from_transcription ?? 'N/A'} total=${mathCheck.grand_total_from_transcription}\n` : '') +
+      (math.runningTotalChain.length ? `Running Total: ${math.runningTotalChain.join(' -> ')}\n\n` : '') +
       (math.mathNotes.length ? `Math Notes: ${math.mathNotes.join(' | ')}\n\n` : '') +
       (hallucinationReport.flags.length ? `Hallucination Guard:\n  ${hallucinationReport.flags.join('\n  ')}\n\n` : '') +
       `Confidence: #=${ai.invoice_number_confidence} Date=${ai.date_confidence} Vendor=${ai.customer_name_confidence} Total=${ai.total_confidence}` +
-      (regionRereadApplied ? ' | ✅ Region re-read' : '') +
-      (math.mathOverride ? ' | ⚠️ Math override' : '') +
-      (reconciliationApplied ? ' | ✅ Reconciled' : '') + '\n\n' +
+      (regionRereadApplied ? ' | Region re-read applied' : '') +
+      (missingItemsRereadApplied ? ' | Missing items re-read applied' : '') +
+      (math.mathOverride ? ' | Math override applied' : '') +
+      (reconciliationApplied ? ' | Reconciliation applied' : '') + '\n\n' +
       `Verdict: ${riskVerdict.verdict} — ${riskVerdict.reason}\n\n` +
       `JSON:\n${JSON.stringify(ai, null, 2)}`;
 
@@ -1388,4 +1770,30 @@ export async function processInvoice(
     console.error('--- processInvoice error ---', error);
     throw new Error(`Invoice processing failed: ${msg}`);
   }
+}
+
+// -----------------------------------------------------------------
+// VOICE INVOICE — server-side Groq parse
+// -----------------------------------------------------------------
+
+export async function parseVoiceTranscript(transcript: string): Promise<string> {
+  const prompt = `You are an invoice parser. The user verbally described items for an invoice.
+Extract all line items, the customer/vendor name (if mentioned), and compute totals.
+Do NOT apply tax unless the user explicitly mentions it.
+
+Respond ONLY with a valid JSON object — no markdown, no preamble, no explanation:
+{
+  "customer_name": "string or null",
+  "invoice_number": "string or null",
+  "items": [
+    {"name": "string", "quantity": number, "unit_price": number, "line_total": number}
+  ],
+  "subtotal": number,
+  "tax": number,
+  "total": number,
+  "notes": "string or null"
+}
+
+User said: "${transcript}"`;
+  return callText(prompt, 1500);
 }

@@ -23,6 +23,7 @@
  * #I18 — Ghana public holiday calendar for time-anomaly check
  * #I19 — Suspiciously identical totals across different vendors flag
  * #I20 — Salesman-readable summary line for every result
+ * v7.1 — Date message now shows calculated overdue months/years instead of raw days
  */
 
 import type { InvoiceProcessingResult, VendorProfile, ValidatedData } from './types';
@@ -96,6 +97,7 @@ export function validateTaxRate(
  * checkDateAnomaly — always produces a meaningful message.
  * #I01: Uses parseGhanaDate for DD/MM/YY and text dates.
  * #I18: Ghana public holiday awareness.
+ * v7.1: Shows calculated overdue months/years, not raw day count.
  */
 export function checkDateAnomaly(dateStr: string | undefined): string | null {
   if (!dateStr) {
@@ -113,26 +115,24 @@ export function checkDateAnomaly(dateStr: string | undefined): string | null {
 
   if (diffDays < -1) {
     const daysAhead = Math.abs(diffDays);
-    return `Invoice is dated ${daysAhead} day${daysAhead !== 1 ? 's' : ''} in the future (${dateStr}). This is a red flag — vendors cannot issue invoices for dates that haven’t happened yet. Do not accept without manager approval.`;
-  }
-
-  if (diffDays > 365) {
-    return `Invoice date (${dateStr}) is over a year old — ${diffDays} days ago. This is extremely overdue and suspicious. Verify this is not a resubmitted or backdated invoice.`;
-  }
-
-  if (diffDays > 180) {
-    return `Invoice date (${dateStr}) is ${diffDays} days ago — more than 6 months overdue. Confirm with your manager before collecting payment on such an old invoice.`;
-  }
-
-  if (diffDays > 90) {
-    return `Invoice date (${dateStr}) is ${diffDays} days ago — over 90 days old. Late invoices may indicate backdating. Confirm this is a legitimate, current invoice before collecting.`;
+    return `Invoice is dated ${daysAhead} day${daysAhead !== 1 ? 's' : ''} in the future (${dateStr}). This is a red flag — vendors cannot issue invoices for dates that haven't happened yet. Do not accept without manager approval.`;
   }
 
   if (diffDays > 30) {
-    return `Invoice date (${dateStr}) is ${diffDays} days ago. This is more than a month old — double-check it’s not a resubmission of a previously paid invoice.`;
+    const totalMonths = Math.floor(diffDays / 30);
+    const years = Math.floor(totalMonths / 12);
+    // If date is more than 2 years ago, it is almost certainly a misread year (e.g. 2012 instead of 2024)
+    if (years >= 2) {
+      return `Invoice date looks wrong (${dateStr}) — the year may have been written incorrectly. Please correct the date before submitting.`;
+    }
+    const remainMonths = totalMonths % 12;
+    const overdueLabel = years > 0
+      ? `${years} year${years !== 1 ? 's' : ''}${remainMonths > 0 ? ` and ${remainMonths} month${remainMonths !== 1 ? 's' : ''}` : ''}`
+      : `${totalMonths} month${totalMonths !== 1 ? 's' : ''}`;
+    return `Invoice date is ${overdueLabel} old (${dateStr}). Make sure you have written today's date correctly.`;
   }
 
-  return null; // Within 30 days — OK
+  return null; // Within 30 days - OK
 }
 
 export function buildSmartName(data: ValidatedData): string {
@@ -213,10 +213,10 @@ export function checkVendorTotalRange(
   const name = vendorName || 'this vendor';
 
   if (newTotal > max * 3) {
-    return `Invoice total (${newTotal.toFixed(2)}) is more than 3× the highest previous invoice from ${name} (max was ${max.toFixed(2)}, average ${avg.toFixed(2)}). This is highly unusual — verify before collecting.`;
+    return `Invoice total (${newTotal.toFixed(2)}) is more than 3x the highest previous invoice from ${name} (max was ${max.toFixed(2)}, average ${avg.toFixed(2)}). This is highly unusual — verify before collecting.`;
   }
   if (newTotal > avg * 2.5 && totals.length >= 5) {
-    return `Invoice total (${newTotal.toFixed(2)}) is 2.5× above the average for ${name} (average: ${avg.toFixed(2)}). Confirm this is a genuine large order.`;
+    return `Invoice total (${newTotal.toFixed(2)}) is 2.5x above the average for ${name} (average: ${avg.toFixed(2)}). Confirm this is a genuine large order.`;
   }
   if (newTotal < min * 0.2 && totals.length >= 5) {
     return `Invoice total (${newTotal.toFixed(2)}) is far below the normal range for ${name} (minimum seen: ${min.toFixed(2)}). This may be a partial payment or keying error.`;
@@ -330,10 +330,13 @@ export function normaliseItemName(name: string): string {
     [/\bfrozen\s*chick/g,      'frozen chicken'],
     [/\bmackerel\b/g,          'mackerel'],
     [/\bsard\b/g,              'sardine'],
-    // Electronics / accessories
+    // Electronics / electrical
     [/\bbatt\b/g,              'battery'],
     [/\bbulb\b/g,              'light bulb'],
     [/\bled\b/g,               'led bulb'],
+    [/\bsassin\b/g,            'distribution board'],
+    [/\btrunking\b/g,          'cable trunking'],
+    [/\brosette\b/g,           'ceiling rose'],
     // Transport
     [/\btrip\b/g,              'delivery trip'],
     [/\bdel\s*fee/g,           'delivery fee'],
@@ -690,7 +693,6 @@ export function checkRoundNumberAnomaly(
   itemCount: number
 ): string | null {
   if (total === undefined || itemCount === 0) return null;
-  // Only flag when there are multiple items (lump-sum invoices are legitimately round)
   if (itemCount < 2) return null;
   if (total <= 0) return null;
 
@@ -758,7 +760,6 @@ export function checkVendorNameFuzzyMatch(
 
 // ─────────────────────────────────────────────────────────────
 // #I07 — PROFORMA INVOICE CLASSIFIER
-// Proforma = not a real invoice, should not trigger ACCEPT verdict
 // ─────────────────────────────────────────────────────────────
 export function isProformaInvoice(ocrText: string | undefined): boolean {
   if (!ocrText) return false;
@@ -776,7 +777,6 @@ export function isProformaInvoice(ocrText: string | undefined): boolean {
 
 // ─────────────────────────────────────────────────────────────
 // #I08 — WEST AFRICA CURRENCY GUARD
-// Flags when foreign West Africa currencies appear in a GHS invoice
 // ─────────────────────────────────────────────────────────────
 export function checkForeignCurrencyInGHS(
   detectedCurrency: string | undefined,
@@ -798,7 +798,6 @@ export function checkForeignCurrencyInGHS(
 
 // ─────────────────────────────────────────────────────────────
 // #I11 — CUMULATIVE VENDOR SPEND WARNING
-// Warns when total spend from one vendor exceeds a threshold
 // ─────────────────────────────────────────────────────────────
 export function checkCumulativeVendorSpend(
   vendorHistory: InvoiceProcessingResult[],
@@ -843,10 +842,10 @@ export function buildDailyCollectionSummary(history: InvoiceProcessingResult[]):
 const GHANA_PUBLIC_HOLIDAYS: Array<{ month: number; day: number; name: string }> = [
   { month: 1,  day: 1,  name: "New Year's Day" },
   { month: 3,  day: 6,  name: 'Independence Day' },
-  { month: 5,  day: 1,  name: 'Workers\u2019 Day (Labour Day)' },
+  { month: 5,  day: 1,  name: "Workers' Day (Labour Day)" },
   { month: 5,  day: 25, name: 'Africa Day' },
   { month: 7,  day: 1,  name: 'Republic Day' },
-  { month: 8,  day: 4,  name: 'Founders\u2019 Day' },
+  { month: 8,  day: 4,  name: "Founders' Day" },
   { month: 9,  day: 21, name: 'Kwame Nkrumah Memorial Day' },
   { month: 12, day: 25, name: 'Christmas Day' },
   { month: 12, day: 26, name: 'Boxing Day' },
@@ -861,7 +860,6 @@ function isGhanaPublicHoliday(date: Date): string | null {
 
 // ─────────────────────────────────────────────────────────────
 // #I19 — CROSS-VENDOR IDENTICAL TOTAL FLAG
-// Same total, same day, different vendors = suspicious
 // ─────────────────────────────────────────────────────────────
 export function checkIdenticalTotalCrossVendor(
   newTotal: number | undefined,
@@ -895,6 +893,6 @@ export function buildSalesmanSummary(result: InvoiceProcessingResult): string {
   if (verdict === 'ACCEPT') return `✅ ${vendor} — ${total} — ${items} item${items !== 1 ? 's' : ''} — Safe to collect.`;
   if (verdict === 'CAUTION') return `⚠️ ${vendor} — ${total} — Review flagged issues before collecting.`;
   if (verdict === 'REJECT') return `🔴 ${vendor} — ${total} — DO NOT COLLECT. See reason below.`;
-  if (verdict === 'ESCALATE') return `🚨 ${vendor} — ${total} — CALL MANAGER before collecting.`;
+  if (verdict === 'ESCALATE') return `🚨 ${vendor} — ${total} — Check and rewrite the correct invoice.`;
   return `${vendor} — ${total}`;
 }
