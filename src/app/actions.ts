@@ -65,6 +65,7 @@ import {
   checkVendorNameFuzzyMatch,
   checkCumulativeVendorSpend,
   buildSalesmanSummary,
+    checkCustomerCreditHistory,
 } from '@/lib/invoice-intelligence';
 
 // -----------------------------------------------------------------
@@ -304,9 +305,9 @@ Respond with ONLY a JSON object, nothing else:
   "confidence": "high" or "medium" or "low"
 }`;
 
-async function guardDocumentType(imageUrl: string, apiKey: string): Promise<{ ok: boolean; detectedAs: string }> {
+async function guardDocumentType(imageUrl: string): Promise<{ ok: boolean; detectedAs: string }> {
   try {
-    const raw = await callGroqVision(imageUrl, DOCUMENT_GUARD_PROMPT, apiKey);
+    const raw = await getVisionCaller(imageUrl, DOCUMENT_GUARD_PROMPT);
     const cleaned = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
     let parsed: any;
     try { parsed = JSON.parse(cleaned); } catch { const m = cleaned.match(/\{[\s\S]*\}/); parsed = m ? JSON.parse(m[0]) : null; }
@@ -839,7 +840,10 @@ CONFIDENCE: [high / medium / low]
 IF NOT HIGH: [what makes it hard to read]`;
 
 // -----------------------------------------------------------------
-// #14 — TIME-OF-DAY ANOMALY CHECK
+// #14 — TIME-OF-DAY ANOMALY CHECK (v7.6 — Ghana-aware)
+// Ghana salesmen work Mon–Sat. Sunday is the only rest day.
+// After-hours warning removed — salesmen work late legitimately.
+// Only truly suspicious times are flagged: past midnight or Sunday.
 // -----------------------------------------------------------------
 
 function checkTimeOfDayAnomaly(): string | null {
@@ -847,34 +851,18 @@ function checkTimeOfDayAnomaly(): string | null {
   const hour = now.getHours();
   const day = now.getDay(); // 0=Sun, 6=Sat
 
-  if (day === 0 || day === 6) {
-    return `This invoice was submitted on a ${day === 0 ? 'Sunday' : 'Saturday'}. Most businesses are closed on weekends. Look carefully and confirm this is a legitimate transaction before collecting money.`;
+  // Sunday only — Saturday is a normal work day in Ghana
+  if (day === 0) {
+    return `This invoice was submitted on a Sunday. Confirm this is a genuine transaction — most businesses are closed on Sundays.`;
   }
-  if (hour >= 22 || hour < 5) {
-    return `This invoice was submitted at ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — very late at night. Unusual submission times can be a sign of fraud. Review the invoice carefully before collecting.`;
-  }
-  if (hour >= 20) {
-    return `Invoice submitted after 8pm (${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}). Confirm this is expected — after-hours submissions should be verified.`;
+  // Only flag truly suspicious late-night hours (midnight to 4am)
+  if (hour >= 0 && hour < 4) {
+    return `Invoice submitted at ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — unusually late at night. Verify this is not a backdated or fraudulent submission.`;
   }
   return null;
 }
 
-// -----------------------------------------------------------------
-// LAYER 3.5 — QUANTITY AUTO-CORRECTION (v7.3)
-// Runs after OCR, before math engine.
-// If qty × unit_price ≠ line_total but line_total / unit_price = whole number,
-// we correct qty mathematically — no second Groq call needed.
-// Also strips NPC prefix from item names ("5PC 2Gang Switch" → qty=5, name="2Gang Switch")
-// -----------------------------------------------------------------
 
-function autoCorrectQuantities(items: any[]): { items: any[]; corrections: string[] } {
-  // v7.3 quantity auto-correction is DISABLED.
-  // Groq inconsistently embeds quantities in item names ("5PC 2Gang Switch") vs the QTY column,
-  // and any code-level correction amplifies OCR noise rather than fixing it.
-  // The math engine already flags column-sum mismatches correctly.
-  // Future fix: switch to a better vision model (Claude/GPT-4o) for reliable handwriting OCR.
-  return { items, corrections: [] };
-}
 
 // -----------------------------------------------------------------
 // LAYER 4 — MATH ENGINE (v6.0)
@@ -1394,9 +1382,9 @@ export async function processInvoice(
     const imageUrl = await ensureImageUnderLimit(imageBase64);
     console.log(`[Invoice] Image size: ${Math.round((imageUrl.split(',')[1]?.length ?? 0) / 1024)}KB base64`);
 
-    // Document type guard
+    // Document type guard — v7.6: uses getVisionCaller (OpenRouter first)
     console.log('[Invoice] Document guard: checking image is a financial document...');
-    const guard = await guardDocumentType(imageUrl, groqApiKey);
+    const guard = await guardDocumentType(imageUrl);
     if (!guard.ok) {
       throw new Error(
         `This doesn't look like an invoice or receipt — it appears to be a ${guard.detectedAs}. ` +
@@ -1435,16 +1423,6 @@ export async function processInvoice(
     console.log('[Invoice] Math pre-check + Pass 2 done');
 
     let ai = parseGroqJson(rawJson);
-
-    // v7.3 — auto-correct quantities before any further processing
-    if (ai.items && Array.isArray(ai.items)) {
-      const { items: correctedItems, corrections } = autoCorrectQuantities(ai.items);
-      if (corrections.length > 0) {
-        console.log(`[Invoice] v7.3 qty corrections: ${corrections.join(' | ')}`);
-        ai = { ...ai, items: correctedItems };
-      }
-    }
-
     let math = runMathEngine(ai, mathCheck);
     let hallucinationReport = runHallucinationGuard(ai, math);
 
@@ -1746,6 +1724,7 @@ Respond ONLY with a JSON array — no markdown, no explanation:
 
     // Protocol 7: Duplicate + partial payment
     let isDuplicate = false, duplicateOfId: string | undefined;
+    let crossCustomerDuplicate = false;
     let isPartialPayment = false, partialPaymentOriginalTotal: number | undefined, partialPaymentOriginalId: string | undefined;
     let isRecurring = false, recurringDelta: number | undefined;
     let invNumberGapWarning: string | undefined;
@@ -1760,6 +1739,7 @@ Respond ONLY with a JSON array — no markdown, no explanation:
       const dupResult = detectDuplicate(tempForDetection, invoiceHistory as InvoiceProcessingResult[]);
       isDuplicate = dupResult.isDuplicate;
       duplicateOfId = dupResult.duplicateOfId;
+      crossCustomerDuplicate = dupResult.crossCustomer ?? false;
 
       if (isDuplicate) {
         errors.push({ field: 'duplicate', message: `DUPLICATE INVOICE: Already recorded${duplicateOfId ? ` (ID: ${duplicateOfId})` : ''}. -> Do NOT collect again. Inform vendor this invoice was already processed.` });
@@ -1807,7 +1787,7 @@ Respond ONLY with a JSON array — no markdown, no explanation:
     // Build final result
     const isValid = errors.length === 0;
     const ocrText =
-      `[InvoiceGuard v7.1 | ${ai.currency ?? 'GHS'} | ${ai.document_type_observed ?? (ai.is_gra_invoice ? 'GRA Invoice' : 'Invoice')} | ${ai.writing_type ?? 'unknown'} | ${math.vatIncluded ? 'VAT-inclusive pricing' : 'Tax rows present'}]\n\n` +
+      `[InvoiceGuard v7.6 | ${ai.currency ?? 'GHS'} | ${ai.document_type_observed ?? (ai.is_gra_invoice ? 'GRA Invoice' : 'Invoice')} | ${ai.writing_type ?? 'unknown'} | ${math.vatIncluded ? 'VAT-inclusive pricing' : 'Tax rows present'}]\n\n` +
       `PASS 1 OCR:\n${transcription}\n\n` +
       (mathCheck ? `Math Pre-Check: items_sum=${mathCheck.items_sum ?? 'N/A'} subtotal=${mathCheck.subtotal_from_transcription ?? 'N/A'} tax=${mathCheck.tax_sum_from_transcription ?? 'N/A'} total=${mathCheck.grand_total_from_transcription}\n` : '') +
       (math.runningTotalChain.length ? `Running Total: ${math.runningTotalChain.join(' -> ')}\n\n` : '') +
@@ -1831,6 +1811,7 @@ Respond ONLY with a JSON array — no markdown, no explanation:
       smartName:                buildSmartName(validatedData),
       currency:                 ai.currency || 'GHS',
       isDuplicate, duplicateOfId,
+      ...(crossCustomerDuplicate ? { crossCustomerDuplicate: true } : {}),
       isPartialPayment, partialPaymentOriginalTotal, partialPaymentOriginalId,
       isRecurring, recurringDelta,
       priceWarnings,
@@ -1855,6 +1836,12 @@ Respond ONLY with a JSON array — no markdown, no explanation:
     if (isCreditSale) {
       result.isCreditSale = true;
       result.creditSaleNote = ai.credit_note || 'Not Paid / Credit Sale detected on invoice';
+      // Check if customer already has outstanding credit
+      const creditHistory = checkCustomerCreditHistory(validatedData.customer_name, invoiceHistory as InvoiceProcessingResult[]);
+      if (creditHistory.hasOutstandingCredit) {
+        (result as any).hasOutstandingCredit = true;
+        (result as any).outstandingCreditTotal = creditHistory.totalOwed;
+      }
       // Override verdict to CAUTION if currently ACCEPT — money hasn't been collected yet
       if (result.riskVerdict?.verdict === 'ACCEPT') {
         result.riskVerdict = {

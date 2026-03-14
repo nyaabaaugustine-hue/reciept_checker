@@ -36,21 +36,46 @@ export function normaliseVendorKey(name: string | undefined): string {
 export function detectDuplicate(
   result: InvoiceProcessingResult,
   history: InvoiceProcessingResult[]
-): { isDuplicate: boolean; duplicateOfId?: string } {
+): { isDuplicate: boolean; duplicateOfId?: string; crossCustomer?: boolean } {
   const invNo = result.validatedData.invoice_number;
   const total = result.validatedData.total;
   const vendorKey = normaliseVendorKey(result.validatedData.customer_name);
+  const today = new Date().toDateString();
 
   for (const h of history) {
     if (h.id === result.id) continue;
     const hVendorKey = normaliseVendorKey(h.validatedData.customer_name);
+
+    // STRONG: exact invoice number + same customer
     if (invNo && h.validatedData.invoice_number === invNo && hVendorKey === vendorKey)
-      return { isDuplicate: true, duplicateOfId: h.id };
+      return { isDuplicate: true, duplicateOfId: h.id, crossCustomer: false };
+
+    // STRONG: same total + same customer + same date
     if (
       total !== undefined && h.validatedData.total === total &&
       hVendorKey === vendorKey && h.validatedData.date === result.validatedData.date &&
       h.validatedData.date !== undefined
-    ) return { isDuplicate: true, duplicateOfId: h.id };
+    ) return { isDuplicate: true, duplicateOfId: h.id, crossCustomer: false };
+
+    // NEW: same invoice number across DIFFERENT customers — flag as cross-customer duplicate
+    // Salesmen sometimes reuse invoice books so same number appears for different customers
+    if (
+      invNo &&
+      h.validatedData.invoice_number === invNo &&
+      hVendorKey !== vendorKey &&
+      hVendorKey !== '__unknown__' &&
+      vendorKey !== '__unknown__'
+    ) return { isDuplicate: true, duplicateOfId: h.id, crossCustomer: true };
+
+    // NEW: same total + same date + today = strong same-day duplicate signal
+    if (
+      total !== undefined &&
+      total > 0 &&
+      h.validatedData.total === total &&
+      new Date(h.createdAt).toDateString() === today &&
+      new Date().toDateString() === today &&
+      hVendorKey === vendorKey
+    ) return { isDuplicate: true, duplicateOfId: h.id, crossCustomer: false };
   }
   return { isDuplicate: false };
 }
@@ -692,22 +717,26 @@ export function checkRoundNumberAnomaly(
   total: number | undefined,
   itemCount: number
 ): string | null {
+  // v7.6: Only flag round numbers on invoices with 5+ items.
+  // Simple invoices (1-4 items) often legitimately have round totals.
+  // The risk of a hand-keyed estimate only meaningfully exists on complex multi-item invoices.
   if (total === undefined || itemCount === 0) return null;
-  if (itemCount < 2) return null;
+  if (itemCount < 5) return null; // raised from 2 to 5
   if (total <= 0) return null;
 
   const isRound1000 = total % 1000 === 0 && total >= 1000;
   const isRound500  = total % 500  === 0 && total >= 500 && !isRound1000;
-  const isRound100  = total % 100  === 0 && total >= 100 && !isRound500 && !isRound1000;
+  // Only flag round-100 on 8+ items — too noisy otherwise
+  const isRound100  = total % 100  === 0 && total >= 100 && !isRound500 && !isRound1000 && itemCount >= 8;
 
   if (isRound1000) {
-    return `Grand total is a very round number (${total.toFixed(2)}) on a multi-item invoice. Hand-keyed round numbers are a common error. Verify every line total adds up correctly.`;
+    return `Grand total is a very round number (${total.toFixed(2)}) across ${itemCount} items. Verify every line total was calculated correctly and not estimated.`;
   }
   if (isRound500) {
-    return `Grand total ends in exactly 500 (${total.toFixed(2)}) across ${itemCount} items. Double-check the addition is correct — this could be a rounded estimate rather than a calculated total.`;
+    return `Grand total ends in exactly 500 (${total.toFixed(2)}) across ${itemCount} items. Double-check the addition is correct.`;
   }
   if (isRound100) {
-    return `Total is a round number (${total.toFixed(2)}). Confirm this matches the sum of all line items, not an estimated lump sum.`;
+    return `Total is a round number (${total.toFixed(2)}) across ${itemCount} items. Confirm this matches the sum of all line items.`;
   }
   return null;
 }
@@ -861,6 +890,23 @@ function isGhanaPublicHoliday(date: Date): string | null {
 // ─────────────────────────────────────────────────────────────
 // #I19 — CROSS-VENDOR IDENTICAL TOTAL FLAG
 // ─────────────────────────────────────────────────────────────
+// v7.6 — CUSTOMER CREDIT HISTORY
+export function checkCustomerCreditHistory(
+  customerName: string | undefined,
+  history: InvoiceProcessingResult[]
+): { hasOutstandingCredit: boolean; totalOwed: number; count: number; oldestDate: string | undefined } {
+  if (!customerName) return { hasOutstandingCredit: false, totalOwed: 0, count: 0, oldestDate: undefined };
+  const key = normaliseVendorKey(customerName);
+  const outstanding = history.filter(h => {
+    const hKey = normaliseVendorKey(h.validatedData.customer_name);
+    return hKey === key && h.isCreditSale === true && h.status !== 'approved' && h.status !== 'rejected';
+  });
+  if (outstanding.length === 0) return { hasOutstandingCredit: false, totalOwed: 0, count: 0, oldestDate: undefined };
+  const totalOwed = outstanding.reduce((s, h) => s + (h.validatedData.total ?? 0), 0);
+  const sorted = [...outstanding].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return { hasOutstandingCredit: true, totalOwed: Math.round(totalOwed * 100) / 100, count: outstanding.length, oldestDate: sorted[0]?.createdAt };
+}
+
 export function checkIdenticalTotalCrossVendor(
   newTotal: number | undefined,
   newVendorKey: string | undefined,

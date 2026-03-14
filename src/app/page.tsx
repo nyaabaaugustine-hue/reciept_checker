@@ -18,6 +18,7 @@ import {
   getOfflineQueue, removeFromOfflineQueue, addToOfflineQueue,
   preprocessImage, checkImageQuality,
   checkRiskThreshold,
+  checkCustomerCreditHistory,
 } from '@/lib/invoice-intelligence';
 import { exportAllHistory, importHistory } from '@/lib/utils';
 import { Camera, Upload, History, LayoutDashboard, X } from 'lucide-react';
@@ -150,7 +151,15 @@ export default function HomePage() {
     const quality = await checkImageQuality(imageUri);
     if (!quality.ok) {
       setView('dashboard');
-      toast({ variant: 'destructive', title: 'Poor Image Quality', description: quality.reason, duration: 10000 });
+      // Block the scan completely — show retake screen
+      toast({
+        variant: 'destructive',
+        title: '📷 Retake Photo',
+        description: `${quality.reason} The scan cannot proceed with a bad photo.`,
+        duration: 0, // stays until dismissed
+      });
+      // Re-open camera automatically so salesman retakes immediately
+      setTimeout(() => setIsCameraOpen(true), 800);
       return null;
     }
 
@@ -164,8 +173,14 @@ export default function HomePage() {
       result = await processInvoice(optimised, settings.taxRatePct, slimHistory(history));
     } catch (error: any) {
       const raw: string = error?.message ?? '';
-      const friendly = raw.replace('Invoice processing failed: ', '').replace('Error: ', '')
+      // #22 — user-friendly rate limit message
+      let friendly = raw.replace('Invoice processing failed: ', '').replace('Error: ', '')
         || 'Could not read the invoice. Try again with better lighting.';
+      if (raw.includes('429') || raw.includes('rate limit') || raw.includes('quota') || raw.includes('exhausted')) {
+        friendly = 'Too many scans right now — all AI services are busy. Wait 1 minute and try again.';
+      } else if (raw.includes('network') || raw.includes('fetch') || raw.includes('Failed to fetch')) {
+        friendly = 'No internet connection. The invoice has been saved and will process when your signal returns.';
+      }
       setView('dashboard');
       toast({ variant: 'destructive', title: 'Processing Failed', description: friendly, duration: 10000 });
       return null;
@@ -211,6 +226,18 @@ export default function HomePage() {
     if (result.reconciliationApplied) {
       toast({ title: '🔄 Total Re-verified', description: 'Grand total was re-read and confirmed.', duration: 6000 });
     }
+    // Credit history warning
+    if (result.isCreditSale) {
+      const creditHistory = checkCustomerCreditHistory(result.validatedData.customer_name, history);
+      if (creditHistory.hasOutstandingCredit) {
+        toast({
+          variant: 'destructive',
+          title: `📋 ${result.validatedData.customer_name} Already Owes GH¢${creditHistory.totalOwed.toFixed(2)}`,
+          description: `This customer has ${creditHistory.count} outstanding credit invoice${creditHistory.count !== 1 ? 's' : ''} unpaid. Collect the old debt before giving more credit.`,
+          duration: 15000,
+        });
+      }
+    }
 
     setHistory(prev => [result, ...prev]);
     setActiveResult(result);
@@ -225,10 +252,27 @@ export default function HomePage() {
     if (!isOnline) {
       addToOfflineQueue(imageUri);
       setOfflineQueueCount(getOfflineQueue().length);
-      toast({ title: '📵 Offline — Queued', description: 'Will process when back online.', duration: 8000 });
+      toast({
+        title: '📵 No Internet — Invoice Saved',
+        description: `Invoice saved to queue (${getOfflineQueue().length} waiting). It will be processed automatically when your signal returns. You can keep scanning.`,
+        duration: 10000,
+      });
       return;
     }
     try { await submitImage(imageUri); }
+    catch (err: any) {
+      // If the scan fails due to network error, queue it
+      if (err?.message?.includes('fetch') || err?.message?.includes('network') || err?.message?.includes('NetworkError')) {
+        addToOfflineQueue(imageUri);
+        setOfflineQueueCount(getOfflineQueue().length);
+        setView('dashboard');
+        toast({
+          title: '📵 Network Error — Invoice Queued',
+          description: 'Could not reach the server. Invoice saved and will retry automatically when connection is restored.',
+          duration: 10000,
+        });
+      }
+    }
     finally { setProcessingStatus(null); }
   };
 
@@ -266,10 +310,24 @@ export default function HomePage() {
     setActiveResult(prev => prev ? { ...prev, dueDate } : null);
   };
   const handleApprove = (id: string) => {
+    const result = history.find(i => i.id === id) ?? activeResult;
+    // Block submission of credit sale if no due date set
+    if (result?.isCreditSale && !result?.dueDate) {
+      toast({
+        variant: 'destructive',
+        title: '📋 Credit Sale — Due Date Required',
+        description: 'You must set a payment due date before submitting a credit sale. Scroll up and set the due date.',
+        duration: 8000,
+      });
+      return;
+    }
     const now = new Date().toISOString();
     setHistory(prev => prev.map(i => i.id === id ? { ...i, status: 'approved', approvedAt: now } : i));
     setActiveResult(prev => prev ? { ...prev, status: 'approved', approvedAt: now } : null);
-    toast({ title: '✅ Approved', description: 'Invoice approved. Safe to collect payment.' });
+    const msg = result?.isCreditSale
+      ? `Credit sale recorded. Follow up for payment on ${result.dueDate}.`
+      : 'Invoice submitted successfully.';
+    toast({ title: '✅ Submitted', description: msg });
   };
   const handleReject = (id: string, reason: string) => {
     const now = new Date().toISOString();

@@ -145,7 +145,10 @@ export const ResultsView = ({
   const [dueDate, setDueDate] = useState(result.dueDate || '');
   const [rejectReason, setRejectReason] = useState('');
   const [showRejectInput, setShowRejectInput] = useState(false);
-  const [showDetails, setShowDetails] = useState(false);
+  // Auto-open edit panel when there are errors — salesman needs to fix before submitting
+  const [showDetails, setShowDetails] = useState(
+    result.errors.some(e => ['items', 'math', 'hallucination', 'subtotal'].includes(e.field) || e.field.includes('line_total'))
+  );
   const [showAILog, setShowAILog] = useState(false);
   // #13 delivery confirmation
   const [deliveryChecked, setDeliveryChecked] = useState<boolean[]>([]);
@@ -418,6 +421,22 @@ export const ResultsView = ({
         </div>
       )}
 
+      {/* ── OUTSTANDING CREDIT WARNING ── */}
+      {result.isCreditSale && (result as any).hasOutstandingCredit && (
+        <div className="rounded-2xl border-2 border-red-500 bg-red-50 dark:bg-red-950/40 p-4 flex items-start gap-3">
+          <AlertOctagon className="h-7 w-7 text-red-600 flex-shrink-0" />
+          <div>
+            <p className="font-black text-red-700 dark:text-red-400 text-base">Customer Already Has Unpaid Credit!</p>
+            <p className="text-sm text-red-600 dark:text-red-300 mt-1">
+              <strong>{result.validatedData.customer_name}</strong> already owes <strong>GH¢{((result as any).outstandingCreditTotal ?? 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</strong> from previous credit sales.
+            </p>
+            <p className="text-xs text-red-700 dark:text-red-400 mt-2 font-semibold">
+              → Collect the existing debt before giving more credit. Check with your manager.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* ── CREDIT SALE ALERT ── */}
       {result.isCreditSale && (
         <div className="rounded-2xl border-2 border-purple-500 bg-purple-50 dark:bg-purple-950/40 p-4 flex items-start gap-3">
@@ -448,11 +467,26 @@ export const ResultsView = ({
         <div className="rounded-2xl border-2 border-red-500 bg-red-50 dark:bg-red-950/40 p-4 flex items-start gap-3">
           <AlertOctagon className="h-7 w-7 text-red-600 flex-shrink-0" />
           <div>
-            <p className="font-black text-red-700 dark:text-red-400 text-base">Duplicate Invoice!</p>
-            <p className="text-sm text-red-600 dark:text-red-300 mt-1">This invoice matches one already in your history. Do NOT collect payment twice.</p>
-            <p className="text-xs text-red-700 dark:text-red-400 mt-2 font-semibold">
-              → Inform the vendor this invoice was already processed. Request a new invoice if a new transaction occurred.
-            </p>
+            {(result as any).crossCustomerDuplicate ? (
+              <>
+                <p className="font-black text-red-700 dark:text-red-400 text-base">Same Invoice Number — Different Customer!</p>
+                <p className="text-sm text-red-600 dark:text-red-300 mt-1">
+                  Invoice number <strong>{result.validatedData.invoice_number}</strong> was already used for a different customer.
+                  You may be reusing an old invoice book.
+                </p>
+                <p className="text-xs text-red-700 dark:text-red-400 mt-2 font-semibold">
+                  → Use a new invoice number for this transaction. Do not reuse numbers from old books.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="font-black text-red-700 dark:text-red-400 text-base">Duplicate Invoice!</p>
+                <p className="text-sm text-red-600 dark:text-red-300 mt-1">This invoice matches one already in your history. Do NOT submit again.</p>
+                <p className="text-xs text-red-700 dark:text-red-400 mt-2 font-semibold">
+                  → This invoice was already submitted. If this is a new transaction, write a new invoice with a different number.
+                </p>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -711,12 +745,35 @@ export const ResultsView = ({
       </div>
 
       {/* ── DUE DATE ── */}
-      <div className="rounded-2xl border bg-card p-4 space-y-2">
-        <p className="font-semibold flex items-center gap-2 text-sm"><CalendarClock className="h-5 w-5 text-primary" /> Payment Due Date</p>
+      <div className={`rounded-2xl border-2 p-4 space-y-2 ${
+        result.isCreditSale && !dueDate
+          ? 'border-red-400 bg-red-50 dark:bg-red-950/30 animate-pulse'
+          : result.isCreditSale
+          ? 'border-purple-400 bg-purple-50 dark:bg-purple-950/20'
+          : 'border-border bg-card'
+      }`}>
+        <p className={`font-semibold flex items-center gap-2 text-sm ${
+          result.isCreditSale && !dueDate ? 'text-red-600' : result.isCreditSale ? 'text-purple-700 dark:text-purple-300' : ''
+        }`}>
+          <CalendarClock className="h-5 w-5" />
+          {result.isCreditSale ? (
+            !dueDate ? '⚠️ Credit Sale — Set Payment Due Date (REQUIRED)' : '📌 Credit Payment Due Date'
+          ) : 'Payment Due Date'}
+        </p>
         <div className="flex gap-2">
-          <Input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} className="flex-1 h-12 rounded-xl text-base" />
+          <Input
+            type="date"
+            value={dueDate}
+            onChange={e => setDueDate(e.target.value)}
+            className={`flex-1 h-12 rounded-xl text-base ${
+              result.isCreditSale && !dueDate ? 'border-red-400 border-2' : ''
+            }`}
+          />
           <button className="action-btn-primary !w-auto !min-w-[72px] !flex-none" onClick={handleDueDateSave}>Set</button>
         </div>
+        {result.isCreditSale && !dueDate && (
+          <p className="text-xs text-red-600 font-semibold">→ You cannot submit this invoice without a payment due date.</p>
+        )}
       </div>
 
       {/* ── NOTES ── */}
@@ -842,10 +899,30 @@ export const ResultsView = ({
         <p className="font-semibold text-sm flex items-center gap-2"><Share2 className="h-4 w-4 text-primary" /> Share This Invoice</p>
         <div className="flex gap-2">
           <button
-            onClick={() => shareViaWhatsApp(result, currency)}
+            onClick={() => {
+              const d = editedData;
+              const total = d.total?.toLocaleString(undefined, { minimumFractionDigits: 2 }) ?? '?';
+              const items = (d.items || []).map(i =>
+                `  - ${i.quantity !== undefined ? `${i.quantity}x ` : ''}${i.name || 'Item'}${i.line_total !== undefined ? ` = GH¢${i.line_total.toFixed(2)}` : ''}`
+              ).join('
+');
+              const creditLine = result.isCreditSale
+                ? `\n\n⚠️ CREDIT SALE — Amount owed: GH¢${total}\nPayment due: ${result.dueDate || 'not set'}\nPlease pay on the agreed date.`
+                : '';
+              const msg =
+                `*InvoiceGuard Receipt*\n` +
+                `Invoice: #${d.invoice_number || 'N/A'}\n` +
+                `Date: ${d.date || new Date().toLocaleDateString()}\n` +
+                `Customer: ${d.customer_name || 'N/A'}\n\n` +
+                `*Items:*\n${items}\n\n` +
+                `*Total: GH¢${total}*` +
+                creditLine;
+              const url = `https://wa.me/?text=${encodeURIComponent(msg)}`;
+              window.open(url, '_blank');
+            }}
             className="flex-1 h-11 rounded-xl border-2 border-green-500 text-green-700 dark:text-green-400 font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
           >
-            <MessageCircle className="h-4 w-4" /> WhatsApp
+            <MessageCircle className="h-4 w-4" /> {result.isCreditSale ? 'Send Credit Receipt' : 'WhatsApp'}
           </button>
           <button
             onClick={async () => {
@@ -857,6 +934,11 @@ export const ResultsView = ({
             <Share2 className="h-4 w-4" /> Share / Copy
           </button>
         </div>
+        {result.isCreditSale && (
+          <p className="text-xs text-green-700 dark:text-green-400">
+            → Tap “Send Credit Receipt” to WhatsApp the customer their balance and due date.
+          </p>
+        )}
       </div>
 
       {/* ── AI LOG (collapsible) ── */}
