@@ -463,7 +463,11 @@ async function callText(prompt: string, maxTokens = 2500): Promise<string> {
  * #5: Character-level confidence
  * v7.1: 5 critical handwriting rules prevent skipping unknown item names
  */
-const PASS1_PROMPT = `You are an expert forensic document reader. You will be shown a photo or scan of a financial document — it could be ANY type: a GRA tax invoice, a handwritten receipt, a POS printout, a proforma, a delivery note, a simple payment slip, or any other document used to request or record payment.
+const PASS1_PROMPT = `You must NEVER invent financial data that does not appear on the invoice.
+If VAT, tax, or any charges are not explicitly written on the invoice, you must ignore them completely.
+Violating this rule is considered a calculation error.
+
+You are an expert forensic document reader. You will be shown a photo or scan of a financial document — it could be ANY type: a GRA tax invoice, a handwritten receipt, a POS printout, a proforma, a delivery note, a simple payment slip, or any other document used to request or record payment.
 
 YOUR ONLY JOB: Read exactly what is on this document, character by character, digit by digit. Do not guess. Do not fill in. Do not apply any rules or rates you know from memory.
 
@@ -546,8 +550,23 @@ WARNING — CRITICAL HANDWRITING RULES — READ EVERY LINE, SKIP NOTHING:
 6. COUNT ALL LINES: Before finishing, count the total number of item rows you can see. Make sure your item count matches the physical number of rows in the table. If you missed any, go back and read them.
 7. SMUDGED OR FAINT LINES: If a row is faint, tilted, or partially covered — still read it. Use ? for uncertain digits. Do NOT silently omit it.
 8. SIMILAR ITEM NAMES: If the same item appears twice (e.g. "2GANG SWITCH" and "2GANG 2WAY SWITCH"), list BOTH as separate items — do not merge them.
-9. VERIFY YOUR TOTAL: After reading all items, add up all your line totals. If they do not match the grand total written on the invoice, go back and recheck every QUANTITY first — a qty of 9 misread as 1 will cause a large gap.
-10. DATE YEAR SANITY — CRITICAL: Ghana invoices use DD-MM-YY format, NOT DD-MM-YYYY.
+9. STAMPS, CIRCLES AND NOTES ARE NOT LINE ITEMS — BUT MUST BE REPORTED:
+   - Text written inside a circle (e.g. "Not Paid", "Paid", "2034") is a STAMP or NOTE — NOT a line item.
+   - "Not Paid", "Paid", "Received", "Cancelled", "On Credit", "Credit", "Balance Due" written anywhere are PAYMENT STATUS notes.
+   - A number written alone in a circle or next to "Not Paid" is the TOTAL being referenced, not a new line item.
+   - ONLY include rows that are inside the items TABLE with a description and a unit price.
+   - HOWEVER: You MUST report any payment status notes in the OTHER TEXT section at the end.
+   - CREDIT SALE DETECTION: If you see "Not Paid", "On Credit", "Credit Sale", "Balance", "Owing" anywhere on the document, report it as:
+     PAYMENT_STATUS: NOT_PAID (or PAID or CREDIT or PARTIAL)
+     CREDIT_NOTE: [exact text seen]
+
+10. VERIFY YOUR TOTAL: After reading all items, add up all your line totals. If they do not match the grand total written on the invoice, go back and recheck every QUANTITY first — a qty of 9 misread as 1 will cause a large gap.
+11. DATE FORMAT — CRITICAL: Ghana invoices use several date formats — handle ALL of them:
+    FORMAT A: DD-MM-YY written as one string e.g. "14-06-24" → 2024-06-14
+    FORMAT B: Separate boxes labelled Day / Month / Year e.g. Day=24, Month=10, Year=25 → 2025-10-24
+    FORMAT C: DD/MM/YYYY e.g. "24/10/2025" → 2025-10-24
+    For FORMAT B (separate boxes): read each box independently and combine them.
+    YEAR SANITY: Ghana invoices use DD-MM-YY format, NOT DD-MM-YYYY.
     - "14-06-24" means 14th June 2024 — the year is 24, meaning 2024.
     - "14-06-2012" is WRONG — nobody writes a 4-digit year starting with 20 on a handwritten Ghana invoice.
     - If you see a date where the year part is 2 digits (24, 23, 22 etc.), convert it: 24 = 2024, 23 = 2023.
@@ -614,7 +633,9 @@ GRAND_TOTAL_CONFIDENCE: [HIGH / MEDIUM / LOW]`;
  * MATH PRE-CHECK (#6: column sum cross-check, #9: currency consistency)
  */
 function buildMathPreCheckPrompt(transcription: string): string {
-  return `You are a pure arithmetic auditor. Verify internal consistency of this invoice transcription.
+  return `STRICT RULE: NEVER invent VAT or tax. If tax is not in the transcription, all tax fields must be null.
+
+You are a pure arithmetic auditor. Verify internal consistency of this invoice transcription.
 
 CRITICAL RULES:
 - Use ONLY numbers from the transcription below
@@ -667,6 +688,11 @@ Respond ONLY with JSON (no markdown):
  * PASS 2 — STRUCTURED JSON EXTRACTION (v6.0)
  */
 function buildPass2Prompt(transcription: string, mathCheck: any): string {
+  // VAT RULE prepended to every Pass 2 call
+  const VAT_RULE = `STRICT RULE: You must NEVER invent VAT, tax, or any financial data not present in the transcription below.
+If VAT or tax does not appear in the transcription, set all tax fields to null and vat_included_in_prices to true.
+Violating this rule is a calculation error.\n\n`;
+
   const mathContext = mathCheck ? `
 ARITHMETIC AUDIT RESULTS:
 - Items sum: ${mathCheck.items_sum ?? 'unknown'}
@@ -684,7 +710,7 @@ ARITHMETIC AUDIT RESULTS:
 - Math-corrected grand total: ${mathCheck.corrected_grand_total ?? 'not available'}
 ` : '';
 
-  return `You are a precise JSON data extractor for financial documents.
+  return `${VAT_RULE}You are a precise JSON data extractor for financial documents.
 
 TRANSCRIPTION:
 ${transcription}
@@ -751,7 +777,9 @@ Respond ONLY with valid JSON (no markdown):
   "total": number_or_null,
   "total_confidence": "high|medium|low",
   "total_uncertain_digits": "describe any ? in the grand total, or null",
-  "ocr_notes": "specific uncertain readings, quality issues, anything unusual"
+  "ocr_notes": "specific uncertain readings, quality issues, anything unusual",
+  "payment_status": "PAID or NOT_PAID or CREDIT or PARTIAL or null",
+  "credit_note": "exact text seen on invoice indicating credit/unpaid status, or null"
 }`;
 }
 
@@ -931,61 +959,85 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
     }
   }
 
-  // VAT determination
-  const taxExplicitlyPresent =
-    nhil !== undefined || getfund !== undefined ||
-    covidLevy !== undefined || vat !== undefined || aiTax !== undefined;
-  const vatIncluded = !taxExplicitlyPresent || ai.vat_included_in_prices === true;
+  // ================================================================
+  // VAT / TAX BULLETPROOF ZONE — v7.4
+  // RULE: Tax is ONLY used if ALL of these are true:
+  //   1. At least one tax field (nhil/getfund/covid/vat/tax) is a real number > 0
+  //   2. ai.vat_included_in_prices is explicitly false
+  //   3. For GRA invoices: is_gra_invoice must be true AND tax rows must be present
+  // If ANY condition fails -> vatIncluded = true, all tax = undefined, no tax math
+  // ================================================================
 
-  if (vatIncluded && !taxExplicitlyPresent) {
-    mathNotes.push('No VAT rows on invoice — treated as VAT-inclusive pricing (accepted in Ghana). No tax calculations applied.');
+  // Step 1: hard-null any tax value that is 0 or negative (AI sometimes returns 0 meaning 'not present')
+  const nhilSafe      = (nhil      !== undefined && nhil      > 0) ? nhil      : undefined;
+  const getfundSafe   = (getfund   !== undefined && getfund   > 0) ? getfund   : undefined;
+  const covidSafe     = (covidLevy !== undefined && covidLevy > 0) ? covidLevy : undefined;
+  const vatSafe       = (vat       !== undefined && vat       > 0) ? vat       : undefined;
+  const aiTaxSafe     = (aiTax     !== undefined && aiTax     > 0) ? aiTax     : undefined;
+
+  // Step 2: tax is only 'present' if at least one safe value exists
+  const taxExplicitlyPresent =
+    nhilSafe !== undefined || getfundSafe !== undefined ||
+    covidSafe !== undefined || vatSafe !== undefined || aiTaxSafe !== undefined;
+
+  // Step 3: if AI says vat_included=true, override any stray tax values
+  const aiSaysVatIncluded = ai.vat_included_in_prices === true;
+
+  // Step 4: final vatIncluded determination
+  const vatIncluded = !taxExplicitlyPresent || aiSaysVatIncluded;
+
+  if (vatIncluded) {
+    if (!taxExplicitlyPresent) {
+      mathNotes.push('No VAT/tax rows on invoice — VAT-inclusive pricing. No tax calculations applied.');
+    } else {
+      // AI found tax values but also said vat_included=true — trust vat_included, ignore tax values
+      mathNotes.push('AI flagged vat_included_in_prices=true — ignoring any stray tax values extracted.');
+    }
   }
 
-  // Tax derivation
-  let correctedTax = aiTax;
-  if (taxExplicitlyPresent) {
-    const hasGraLevies = nhil !== undefined || getfund !== undefined || covidLevy !== undefined || vat !== undefined;
+  // Step 5: tax derivation — ONLY runs when vatIncluded is false
+  let correctedTax: number | undefined = undefined;
+  if (!vatIncluded && taxExplicitlyPresent) {
+    const hasGraLevies = nhilSafe !== undefined || getfundSafe !== undefined || covidSafe !== undefined || vatSafe !== undefined;
     if (hasGraLevies) {
-      const computedTax = safeSum(nhil, getfund, covidLevy, vat);
-      if (aiTax === undefined) {
+      const computedTax = safeSum(nhilSafe, getfundSafe, covidSafe, vatSafe);
+      if (aiTaxSafe === undefined) {
         correctedTax = computedTax;
-        mathNotes.push(`Tax derived: NHIL(${nhil ?? 0}) + GETFund(${getfund ?? 0}) + COVID(${covidLevy ?? 0}) + VAT(${vat ?? 0}) = ${computedTax}`);
-      } else if (Math.abs(computedTax - aiTax) > 0.05) {
+        mathNotes.push(`Tax derived from GRA levies: NHIL(${nhilSafe ?? 0}) + GETFund(${getfundSafe ?? 0}) + COVID(${covidSafe ?? 0}) + VAT(${vatSafe ?? 0}) = ${computedTax}`);
+      } else if (Math.abs(computedTax - aiTaxSafe) > 0.05) {
         correctedTax = computedTax;
         mathOverride = true;
-        mathNotes.push(`Tax corrected: ${aiTax} -> ${computedTax}`);
+        mathNotes.push(`Tax corrected from GRA levies: ${aiTaxSafe} -> ${computedTax}`);
+      } else {
+        correctedTax = aiTaxSafe;
       }
+    } else {
+      // Only aiTax present (no breakdown) — use it directly
+      correctedTax = aiTaxSafe;
     }
 
-    if (ai.is_gra_invoice && subtotal && subtotal > 0 && hasGraLevies) {
+    // Step 6: GRA levy rate verification (ONLY for confirmed GRA invoices with levies)
+    if (ai.is_gra_invoice === true && subtotal && subtotal > 0 && hasGraLevies) {
       const expectedNhil    = Math.round(subtotal * 0.025 * 100) / 100;
       const expectedGetfund = Math.round(subtotal * 0.025 * 100) / 100;
       const expectedCovid   = Math.round(subtotal * 0.010 * 100) / 100;
-      const levyBase        = safeSum(subtotal, nhil ?? expectedNhil, getfund ?? expectedGetfund, covidLevy ?? expectedCovid);
+      const levyBase        = safeSum(subtotal, nhilSafe ?? expectedNhil, getfundSafe ?? expectedGetfund, covidSafe ?? expectedCovid);
       const expectedVat     = Math.round(levyBase * 0.15 * 100) / 100;
 
-      if (nhil !== undefined && Math.abs(nhil - expectedNhil) > 0.15) {
-        mathErrors.push(`NHIL error: shows ${nhil.toFixed(2)}, expected ${expectedNhil.toFixed(2)} (2.5% of ${subtotal.toFixed(2)}).`);
-        mathSuggestions.push(`Ask vendor to recalculate NHIL — should be ${expectedNhil.toFixed(2)}.`);
-      }
-      if (getfund !== undefined && Math.abs(getfund - expectedGetfund) > 0.15) {
-        mathErrors.push(`GETFund error: shows ${getfund.toFixed(2)}, expected ${expectedGetfund.toFixed(2)}.`);
-        mathSuggestions.push(`Ask vendor to recalculate GETFund — should be ${expectedGetfund.toFixed(2)}.`);
-      }
-      if (covidLevy !== undefined && Math.abs(covidLevy - expectedCovid) > 0.15) {
-        mathErrors.push(`COVID-19 Levy error: shows ${covidLevy.toFixed(2)}, expected ${expectedCovid.toFixed(2)}.`);
-        mathSuggestions.push(`Ask vendor to recalculate COVID Levy — should be ${expectedCovid.toFixed(2)}.`);
-      }
-      if (vat !== undefined && Math.abs(vat - expectedVat) > 1.50) {
-        mathErrors.push(`VAT error: shows ${vat.toFixed(2)}, expected ${expectedVat.toFixed(2)} (15% of levy base ${levyBase.toFixed(2)}).`);
-        mathSuggestions.push(`Ask vendor to recalculate VAT — should be ${expectedVat.toFixed(2)}.`);
-      }
+      if (nhilSafe !== undefined && Math.abs(nhilSafe - expectedNhil) > 0.15)
+        mathErrors.push(`NHIL error: shows ${nhilSafe.toFixed(2)}, expected ${expectedNhil.toFixed(2)} (2.5% of ${subtotal.toFixed(2)}). -> Ask vendor to correct NHIL.`);
+      if (getfundSafe !== undefined && Math.abs(getfundSafe - expectedGetfund) > 0.15)
+        mathErrors.push(`GETFund error: shows ${getfundSafe.toFixed(2)}, expected ${expectedGetfund.toFixed(2)}. -> Ask vendor to correct GETFund.`);
+      if (covidSafe !== undefined && Math.abs(covidSafe - expectedCovid) > 0.15)
+        mathErrors.push(`COVID-19 Levy error: shows ${covidSafe.toFixed(2)}, expected ${expectedCovid.toFixed(2)}. -> Ask vendor to correct COVID Levy.`);
+      if (vatSafe !== undefined && Math.abs(vatSafe - expectedVat) > 1.50)
+        mathErrors.push(`VAT error: shows ${vatSafe.toFixed(2)}, expected ${expectedVat.toFixed(2)} (15% of levy base ${levyBase.toFixed(2)}). -> Ask vendor to correct VAT.`);
 
       runningTotalChain.push(`Subtotal (pre-tax): ${subtotal.toFixed(2)}`);
-      if (nhil !== undefined) runningTotalChain.push(`+ NHIL 2.5%: ${nhil.toFixed(2)}`);
-      if (getfund !== undefined) runningTotalChain.push(`+ GETFund 2.5%: ${getfund.toFixed(2)}`);
-      if (covidLevy !== undefined) runningTotalChain.push(`+ COVID-19 Levy 1%: ${covidLevy.toFixed(2)}`);
-      if (vat !== undefined) runningTotalChain.push(`+ VAT 15%: ${vat.toFixed(2)}`);
+      if (nhilSafe !== undefined) runningTotalChain.push(`+ NHIL 2.5%: ${nhilSafe.toFixed(2)}`);
+      if (getfundSafe !== undefined) runningTotalChain.push(`+ GETFund 2.5%: ${getfundSafe.toFixed(2)}`);
+      if (covidSafe !== undefined) runningTotalChain.push(`+ COVID-19 Levy 1%: ${covidSafe.toFixed(2)}`);
+      if (vatSafe !== undefined) runningTotalChain.push(`+ VAT 15%: ${vatSafe.toFixed(2)}`);
       if (aiTotal !== undefined) runningTotalChain.push(`= Grand Total: ${aiTotal.toFixed(2)}`);
     } else if (subtotal !== undefined && correctedTax !== undefined) {
       runningTotalChain.push(`Subtotal: ${subtotal.toFixed(2)}`);
@@ -1019,14 +1071,31 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
   itemsSum = Math.round(itemsSum * 100) / 100;
 
   if (hasAnyLineTotal && subtotal !== undefined && Math.abs(itemsSum - subtotal) > 0.10) {
-    mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but stated subtotal is ${subtotal.toFixed(2)} (gap: ${Math.abs(itemsSum - subtotal).toFixed(2)}). One or more line items may be missing or misread.`);
-    mathSuggestions.push(`The items sum (${itemsSum.toFixed(2)}) does not match the subtotal (${subtotal.toFixed(2)}). Count the rows on the physical invoice — a high-value item may have been missed. Ask the vendor to rewrite the correct invoice.`);
+    if (itemsSum > subtotal * 1.5) {
+      // OCR hallucinated extra rows — items sum way exceeds subtotal
+      mathNotes.push(`Items sum (${itemsSum.toFixed(2)}) far exceeds subtotal (${subtotal.toFixed(2)}) — OCR likely read a note/total as a line item. Subtotal used as-is.`);
+    } else {
+      mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but stated subtotal is ${subtotal.toFixed(2)} (gap: ${Math.abs(itemsSum - subtotal).toFixed(2)}). One or more line items may be missing or misread.`);
+      mathSuggestions.push(`The items sum (${itemsSum.toFixed(2)}) does not match the subtotal (${subtotal.toFixed(2)}). Count the rows on the physical invoice — a high-value item may have been missed. Correct and rescan.`);
+    }
   }
   if (hasAnyLineTotal && vatIncluded && aiTotal !== undefined && subtotal === undefined && Math.abs(itemsSum - aiTotal) > 0.10) {
     const gap = Math.abs(itemsSum - aiTotal);
     if (gap / aiTotal > 0.01) {
-      mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but grand total is ${aiTotal.toFixed(2)} (gap: ${gap.toFixed(2)}).`);
-      mathSuggestions.push(`The items sum (${itemsSum.toFixed(2)}) does not match the grand total (${aiTotal.toFixed(2)}). One or more line totals may be wrong.`);
+      if (itemsSum > aiTotal * 1.5) {
+        // Items sum is WAY more than total — AI hallucinated extra rows (e.g. read "Not Paid 2034" as a line item)
+        // Do NOT flag as a math error — flag as an OCR note only
+        mathNotes.push(`Items sum (${itemsSum.toFixed(2)}) exceeds grand total (${aiTotal.toFixed(2)}) — likely OCR hallucinated extra rows. Grand total used as-is.`);
+      } else if (itemsSum < aiTotal) {
+        // Items sum is LESS than total — possible missing line items
+        mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but grand total is ${aiTotal.toFixed(2)} (gap: ${gap.toFixed(2)}).`);
+        mathSuggestions.push(`The items sum (${itemsSum.toFixed(2)}) does not match the grand total (${aiTotal.toFixed(2)}). One or more line totals may be wrong.`);
+      }
+      // If items > total but < 1.5x — flag normally
+      else {
+        mathErrors.push(`Column sum error: all line totals add to ${itemsSum.toFixed(2)} but grand total is ${aiTotal.toFixed(2)} (gap: ${gap.toFixed(2)}).`);
+        mathSuggestions.push(`The items sum (${itemsSum.toFixed(2)}) does not match the grand total (${aiTotal.toFixed(2)}). One or more line totals may be wrong.`);
+      }
     }
   }
 
@@ -1534,7 +1603,8 @@ Respond ONLY with a JSON array — no markdown, no explanation:
       customer_name:  ai.customer_name || undefined,
       category:       ai.category || undefined,
       subtotal:       math.correctedSubtotal,
-      tax:            (!math.vatIncluded && math.correctedTax !== undefined) ? math.correctedTax : undefined,
+      // TAX BULLETPROOF: only include tax if vatIncluded=false AND correctedTax is a real positive number
+      tax: (!math.vatIncluded && math.correctedTax !== undefined && math.correctedTax > 0) ? math.correctedTax : undefined,
       total:          math.correctedTotal ?? parseNumber(ai.total),
       items: (ai.items ?? []).map((item: any) => ({
         name:       item.name || undefined,
@@ -1612,12 +1682,19 @@ Respond ONLY with a JSON array — no markdown, no explanation:
       }
     }
 
-    if (!math.vatIncluded && !ai.is_gra_invoice && validatedData.subtotal && validatedData.tax && validatedData.subtotal > 0) {
+    // Tax rate sanity — ONLY fires when: not VAT-inclusive, not GRA, tax explicitly present and positive
+    if (
+      !math.vatIncluded &&
+      ai.is_gra_invoice !== true &&
+      validatedData.subtotal !== undefined && validatedData.subtotal > 0 &&
+      validatedData.tax !== undefined && validatedData.tax > 0
+    ) {
       const impliedRate = Math.round((validatedData.tax / validatedData.subtotal) * 10000) / 100;
-      if (impliedRate > 0 && Math.abs(impliedRate - taxRatePct) > 15) {
+      // Only flag if rate is wildly wrong (>15% off expected) AND rate is not trivially small
+      if (impliedRate > 1 && Math.abs(impliedRate - taxRatePct) > 15) {
         errors.push({
           field: 'tax',
-          message: `Unusual tax rate: ${impliedRate}% (expected ~${taxRatePct}%). -> Check the tax amount on the physical invoice and verify with the vendor before collecting.`
+          message: `Unusual tax rate: ${impliedRate}% (expected ~${taxRatePct}%). -> Check the tax amount on the physical invoice before submitting.`
         });
       }
     }
@@ -1763,6 +1840,37 @@ Respond ONLY with a JSON array — no markdown, no explanation:
     };
     result.healthScore = calcHealthScore(result);
     result.salesmanSummary = buildSalesmanSummary(result);
+
+    // v7.5 — Credit sale detection
+    // Detect from AI payment_status field OR by scanning the raw OCR text
+    const creditKeywords = /not\s*paid|on\s*credit|credit\s*sale|balance\s*due|owing|not\s*collected|balance/i;
+    const paymentStatus = String(ai.payment_status ?? '').toUpperCase();
+    const isCreditSale =
+      paymentStatus === 'NOT_PAID' ||
+      paymentStatus === 'CREDIT' ||
+      paymentStatus === 'PARTIAL' ||
+      creditKeywords.test(ai.credit_note ?? '') ||
+      creditKeywords.test(transcription);
+
+    if (isCreditSale) {
+      result.isCreditSale = true;
+      result.creditSaleNote = ai.credit_note || 'Not Paid / Credit Sale detected on invoice';
+      // Override verdict to CAUTION if currently ACCEPT — money hasn't been collected yet
+      if (result.riskVerdict?.verdict === 'ACCEPT') {
+        result.riskVerdict = {
+          ...result.riskVerdict,
+          verdict: 'CAUTION',
+          reason: `CREDIT SALE — goods given but money NOT yet collected. Total: ${result.validatedData.total?.toFixed(2) ?? '?'}. Record this and follow up for payment.`,
+          details: [
+            `Credit note on invoice: "${result.creditSaleNote}"`,
+            `→ This invoice is for goods given on credit. Do NOT mark as collected until payment is received.`,
+            `→ Record the customer name, date and amount. Follow up on the due date.`,
+            ...(result.riskVerdict?.details ?? []),
+          ],
+        };
+      }
+    }
+
     return result;
 
   } catch (error: any) {

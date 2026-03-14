@@ -59,13 +59,13 @@ function buildChecklist(result: InvoiceProcessingResult): CheckItem[] {
   if (!d.date) return undefined;
   return d.date;
   })();
-  items.push({ label: 'Invoice date', passed: !!d.date && !errorFields.has('date'), detail: dateOverdueDetail });
+  items.push({ label: d.date && errorFields.has('date') ? 'Wrong date — please correct' : 'Invoice date', passed: !!d.date && !errorFields.has('date'), detail: dateOverdueDetail });
   items.push({ label: 'Line items found', passed: !!(d.items && d.items.length > 0), detail: d.items?.length ? `${d.items.length} item${d.items.length !== 1 ? 's' : ''}` : undefined });
   items.push({ label: 'Grand total readable', passed: d.total !== undefined && !errorFields.has('total'), detail: d.total !== undefined ? d.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : undefined });
-  items.push({ label: 'Subtotal present', passed: d.subtotal !== undefined, detail: d.subtotal !== undefined ? d.subtotal.toFixed(2) : undefined });
-  items.push({ label: 'Tax present', passed: d.tax !== undefined, detail: d.tax !== undefined ? d.tax.toFixed(2) : undefined });
+  items.push({ label: 'Subtotal present', passed: true, detail: d.subtotal !== undefined ? d.subtotal.toFixed(2) : 'Not required on simple invoices' });
+  items.push({ label: 'Tax / VAT', passed: true, detail: d.tax !== undefined ? `VAT: ${d.tax.toFixed(2)}` : 'No VAT on this invoice' });
   items.push({ label: 'Line items maths correct', passed: !result.errors.some(e => e.field.includes('line_total')) });
-  items.push({ label: 'Subtotal + tax = total', passed: !errorFields.has('math') && !errorFields.has('hallucination') });
+  items.push({ label: 'Numbers add up', passed: !errorFields.has('math') && !errorFields.has('hallucination') && !errorFields.has('subtotal') });
   items.push({ label: 'Not a duplicate', passed: !result.isDuplicate });
   items.push({ label: 'Not a partial payment', passed: !result.isPartialPayment });
   items.push({ label: 'No price spikes', passed: !(result.priceWarnings && result.priceWarnings.length > 0) });
@@ -414,6 +414,31 @@ export const ResultsView = ({
             <p className="text-xs text-amber-700 dark:text-amber-400 mt-2 font-semibold">
               → Call your manager to confirm before collecting any money.
             </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── CREDIT SALE ALERT ── */}
+      {result.isCreditSale && (
+        <div className="rounded-2xl border-2 border-purple-500 bg-purple-50 dark:bg-purple-950/40 p-4 flex items-start gap-3">
+          <span className="text-3xl flex-shrink-0">📋</span>
+          <div>
+            <p className="font-black text-purple-700 dark:text-purple-300 text-base">CREDIT SALE — Goods Given, Money NOT Collected</p>
+            <p className="text-sm text-purple-700 dark:text-purple-300 mt-1">
+              This invoice was marked as <strong>NOT PAID / On Credit</strong>. The customer received the goods but has not paid yet.
+            </p>
+            {result.creditSaleNote && (
+              <p className="text-xs font-mono bg-purple-100 dark:bg-purple-900/40 rounded-lg px-3 py-2 mt-2 text-purple-800 dark:text-purple-200">
+                "{result.creditSaleNote}"
+              </p>
+            )}
+            <div className="mt-3 space-y-1">
+              <p className="text-xs font-bold text-purple-700 dark:text-purple-400">→ What to do:</p>
+              <p className="text-xs text-purple-700 dark:text-purple-300">1. Record this in your credit book immediately.</p>
+              <p className="text-xs text-purple-700 dark:text-purple-300">2. Note the customer name, amount ({result.validatedData.total?.toLocaleString(undefined, {minimumFractionDigits: 2})} GHS) and today's date.</p>
+              <p className="text-xs text-purple-700 dark:text-purple-300">3. Follow up with the customer on the agreed payment date.</p>
+              <p className="text-xs text-purple-700 dark:text-purple-300">4. Do NOT submit this as collected — use the Notes field to record the credit date.</p>
+            </div>
           </div>
         </div>
       )}

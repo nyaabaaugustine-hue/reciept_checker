@@ -62,6 +62,9 @@ export type InvoiceProcessingResult = {
   // #fix3 — first-seen price per item for cumulative drift tracking (stored on vendor profile via buildVendorProfiles)
   /** v7.0 — plain-English one-line summary for salesman (built by buildSalesmanSummary) */
   salesmanSummary?: string;
+  /** v7.5 — detected credit sale ("Not Paid", "On Credit" written on invoice) */
+  isCreditSale?: boolean;
+  creditSaleNote?: string;
 };
 
 /** Slim version of InvoiceProcessingResult passed to the server action.
