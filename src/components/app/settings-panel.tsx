@@ -134,7 +134,7 @@ export const SettingsPanel = ({ onClose, onExportAll, onImportAll, historyCount 
           </h3>
           <div className="space-y-1">
             <label className="text-xs font-medium text-muted-foreground">Default Currency</label>
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
               {CURRENCIES.map(c => (
                 <button
                   key={c}

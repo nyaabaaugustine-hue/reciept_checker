@@ -1340,7 +1340,13 @@ function buildRiskVerdict(params: {
     }
   }
 
-  if (timeOfDayWarning) {
+  // #10 — Only show time warning if it's genuinely suspicious (Sunday or midnight)
+  // After-8pm warnings were removed in v7.6 — Ghana salesmen work late legitimately.
+  // Only Sunday or midnight-to-4am warnings are appended.
+  if (timeOfDayWarning && (
+    timeOfDayWarning.includes('Sunday') ||
+    timeOfDayWarning.includes('late at night')
+  )) {
     details.push(`Note: ${timeOfDayWarning}`);
   }
 
@@ -1366,6 +1372,88 @@ function parseGroqJson(raw: string): any {
 }
 
 // -----------------------------------------------------------------
+// v7.7 — POST-OCR ITEM NAME CORRECTION
+// Fixes common OCR garbles without touching numbers.
+// Sorted by frequency of occurrence on real Ghana invoices.
+// -----------------------------------------------------------------
+
+function correctItemName(name: string): string {
+  if (!name) return name;
+  let n = name.trim();
+
+  // Common OCR letter substitutions at start of item names
+  const prefixFixes: [RegExp, string][] = [
+    // B/G -> 1 at start (BAMP -> 13AMP, GAMP -> 13AMP)
+    [/^BAMP\b/i,          '13AMP'],
+    [/^GAMP\b/i,          '13AMP'],
+    [/^BGANG/i,           '2GANG'],
+    [/^GGANG/i,           '2GANG'],
+    [/^BWAY\b/i,          '2WAY'],
+    [/^GWAY\b/i,          '2WAY'],
+    [/^BPIN\b/i,          '3PIN'],
+    [/^GPIN\b/i,          '3PIN'],
+    [/^BCORE\b/i,         '3CORE'],
+    [/^GCORE\b/i,         '3CORE'],
+  ];
+  for (const [rx, fix] of prefixFixes) {
+    if (rx.test(n)) { n = n.replace(rx, fix); break; }
+  }
+
+  // Whole-word OCR garbles — common Ghana electrical/hardware items
+  const wordFixes: [RegExp, string][] = [
+    [/\bSASSIN\b/gi,              'SASSIN DB'],
+    [/\bGKWAY\b/gi,              '2GANG 2WAY'],
+    [/\bBGANG\b/gi,              '2GANG'],
+    [/\bBSOCKET\b/gi,            '13AMP SOCKET'],
+    [/\bGSOCKET\b/gi,            '13AMP SOCKET'],
+    [/\bDBOARD\b/gi,             'DB BOARD'],
+    [/\bD\.BOARD\b/gi,           'DB BOARD'],
+    [/\bCIRCUIT\s*BR[EA]+KER\b/gi, 'CIRCUIT BREAKER'],
+    [/\bCB\s*\d+A/gi,            (m: string) => m.replace(/^CB\s*/i, '').trim() + ' CIRCUIT BREAKER'],
+    [/\bFLEX\s*CABLE\b/gi,       'FLEX CABLE'],
+    [/\bFL[EX]+\s*CORD\b/gi,     'FLEX CORD'],
+    [/\bTRUNKING\b/gi,           'CABLE TRUNKING'],
+    [/\bROSETTE\b/gi,            'CEILING ROSE'],
+    [/\bISO[LI]+ATOR\b/gi,       'ISOLATOR'],
+    [/\bCONDU[I]+T\b/gi,        'CONDUIT'],
+    [/\bARMOUR[ED]*\s*CABLE\b/gi,'ARMOURED CABLE'],
+    // Grocery OCR garbles
+    [/\bMlLO\b/gi,               'MILO'],
+    [/\bMIL0\b/gi,               'MILO'],
+    [/\bNESCAFE\b/gi,            'NESCAFE'],
+    [/\bMAGGI[E]*\b/gi,          'MAGGI'],
+    [/\bCARNATI0N\b/gi,          'CARNATION'],
+    [/\bCARNACTION\b/gi,         'CARNATION'],
+    [/\bKOSMOS\b/gi,             'KOSMOS'],
+    [/\bTOM[A]+TO\s*PU[R]+EE\b/gi, 'TOMATO PUREE'],
+    [/\bTOM[A]+TO\s*P[A]+STE\b/gi, 'TOMATO PASTE'],
+    [/\bSARDINE[S]*\b/gi,        'SARDINES'],
+    [/\bMACKER[EL]+\b/gi,        'MACKEREL'],
+    [/\bVEG[E]*\s*OIL\b/gi,     'VEGETABLE OIL'],
+    [/\bP[AO]LM\s*OIL\b/gi,     'PALM OIL'],
+    [/\bB[AO]SMATI\b/gi,        'BASMATI RICE'],
+    // Building materials
+    [/\bCEM[E]*NT\b/gi,          'CEMENT'],
+    [/\bP\.?C[E]*M[E]*NT\b/gi,  'PORTLAND CEMENT'],
+    [/\bPLYW[O0]+D\b/gi,        'PLYWOOD'],
+    [/\bALUZINC\b/gi,            'ALUZINC ROOFING SHEET'],
+    [/\bG[\.]?I[\.]?\s*SHEET\b/gi, 'GI SHEET'],
+    [/\bPAINT\s*EM[UL]+\b/gi,   'EMULSION PAINT'],
+    [/\bBLOCK[S]*\s*(6|9)\b/gi, (m: string) => m.replace(/BLOCK[S]*/i, 'BLOCK').toUpperCase()],
+  ];
+  for (const [rx, fix] of wordFixes) {
+    if (typeof fix === 'string') {
+      n = n.replace(rx, fix);
+    } else {
+      n = n.replace(rx, fix as any);
+    }
+  }
+
+  // Clean up extra spaces
+  return n.replace(/\s+/g, ' ').trim();
+}
+
+// -----------------------------------------------------------------
 // MAIN SERVER ACTION
 // -----------------------------------------------------------------
 
@@ -1375,7 +1463,11 @@ export async function processInvoice(
   invoiceHistory: SlimInvoiceResult[] = []
 ): Promise<InvoiceProcessingResult> {
   try {
-    const groqApiKey = getGroqApiKey();
+    // v7.7: groqApiKey is optional — OpenRouter/Gemini are primary vision providers
+    const groqApiKey = process.env.GROQ_API_KEY ?? null;
+    if (!groqApiKey && !process.env.OPENROUTER_API_KEY && !process.env.GEMINI_API_KEY) {
+      throw new Error('No API key configured. Set OPENROUTER_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env.local');
+    }
     const matches = imageBase64.match(/^data:(.+);base64,(.+)$/);
     if (!matches) throw new Error('Invalid image format. Expected a base64 data URI.');
 
@@ -1423,6 +1515,16 @@ export async function processInvoice(
     console.log('[Invoice] Math pre-check + Pass 2 done');
 
     let ai = parseGroqJson(rawJson);
+
+    // v7.7 — #6 Post-OCR item name correction
+    // Fixes common OCR garbles on Ghana handwritten invoices without touching numbers
+    if (ai.items && Array.isArray(ai.items)) {
+      ai = { ...ai, items: ai.items.map((item: any) => ({
+        ...item,
+        name: item.name ? correctItemName(item.name) : item.name,
+      }))};
+    }
+
     let math = runMathEngine(ai, mathCheck);
     let hallucinationReport = runHallucinationGuard(ai, math);
 
@@ -1442,7 +1544,7 @@ export async function processInvoice(
         const totalsFields = lowConfidenceFields.filter(f => ['grand total', 'subtotal', 'amount due'].some(x => f.includes(x)));
 
         if (totalsFields.length > 0) {
-          const rereadText = await callGroqVision(imageUrl, buildRegionRereadPrompt('totals', totalsFields), groqApiKey);
+          const rereadText = await getVisionCaller(imageUrl, buildRegionRereadPrompt('totals', totalsFields));
           const totalMatch = rereadText.match(/GRAND_TOTAL_BEST_READING:\s*([\d,]+\.?\d*)/i);
           const confMatch  = rereadText.match(/GRAND_TOTAL_CONFIDENCE:\s*(HIGH|MEDIUM|LOW)/i);
           if (totalMatch && confMatch?.[1]?.toUpperCase() !== 'LOW') {
@@ -1459,7 +1561,7 @@ export async function processInvoice(
         }
 
         if (headerFields.length > 0 && !regionRereadApplied) {
-          const rereadText = await callGroqVision(imageUrl, buildRegionRereadPrompt('header', headerFields), groqApiKey);
+          const rereadText = await getVisionCaller(imageUrl, buildRegionRereadPrompt('header', headerFields));
           const invNoMatch  = rereadText.match(/FIELD:\s*invoice\s*number[\s\S]*?VALUE:\s*([^\n]+)/i);
           const confInvNo   = rereadText.match(/FIELD:\s*invoice\s*number[\s\S]*?CONFIDENCE:\s*(HIGH|MEDIUM|LOW)/i);
           if (invNoMatch && confInvNo?.[1]?.toUpperCase() !== 'LOW' && !ai.invoice_number) {
@@ -1557,7 +1659,7 @@ Respond ONLY with a JSON array — no markdown, no explanation:
     if (hallucinationReport.totalUncertain && hasItems && !regionRereadApplied) {
       console.log('[Invoice] Protocol 8: reconciliation re-query...');
       try {
-        const reconText = await callGroqVision(imageUrl, RECONCILIATION_PROMPT, groqApiKey);
+        const reconText = await getVisionCaller(imageUrl, RECONCILIATION_PROMPT);
         const totalMatch = reconText.match(/GRAND TOTAL:\s*([\d,]+\.?\d*)/i);
         const confMatch  = reconText.match(/CONFIDENCE:\s*(high|medium|low)/i);
         if (totalMatch) {

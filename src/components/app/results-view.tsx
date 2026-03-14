@@ -128,6 +128,46 @@ function buildStory(data: ValidatedData, errors: InvoiceProcessingResult['errors
   return { headline, paragraphs, warnings, actions };
 }
 
+function ManagerEmailPanel({ editedData, result, currency, toast }: {
+  editedData: ValidatedData;
+  result: InvoiceProcessingResult;
+  currency: string;
+  toast: (opts: any) => void;
+}) {
+  const vendor = editedData.customer_name || 'Unknown Vendor';
+  const invNo = editedData.invoice_number ? `#${editedData.invoice_number}` : '(no number)';
+  const total = editedData.total !== undefined ? editedData.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : '?';
+  const verdictLabel = result.riskVerdict?.verdict ?? 'CAUTION';
+  const reason = result.riskVerdict?.reason ?? 'Issues found.';
+  const problems = result.errors.slice(0, 3).map(e => e.message.split(' → ')[0]).join('\n- ');
+  const subject = `[InvoiceGuard] ${verdictLabel} — ${vendor} Invoice ${invNo}`;
+  const body = `Invoice Alert\n\nVerdict: ${verdictLabel}\nVendor: ${vendor}\nInvoice: ${invNo}\nTotal: ${currency} ${total}\n\nIssue: ${reason}\n\nProblems:\n- ${problems}\n\nPlease advise before payment is collected.`;
+  return (
+    <div className="px-4 pb-4 border-t border-amber-200 dark:border-amber-800 space-y-3 pt-3">
+      <div className="bg-white dark:bg-amber-950/20 border border-amber-200 rounded-xl p-3 space-y-1">
+        <p className="text-xs font-bold text-amber-700 dark:text-amber-400">Subject</p>
+        <p className="text-xs font-mono text-amber-900 dark:text-amber-200 leading-snug">{subject}</p>
+        <p className="text-xs font-bold text-amber-700 dark:text-amber-400 mt-2">Body</p>
+        <pre className="text-xs font-mono text-amber-900 dark:text-amber-200 whitespace-pre-wrap leading-snug">{body}</pre>
+      </div>
+      <div className="flex gap-2">
+        <button
+          className="flex-1 h-11 rounded-xl bg-blue-600 text-white font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+          onClick={() => window.open(`mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank', 'noopener,noreferrer')}
+        >
+          <Send className="h-4 w-4" /> Open in Email App
+        </button>
+        <button
+          className="flex-1 h-11 rounded-xl border-2 border-amber-400 text-amber-700 dark:text-amber-300 font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+          onClick={() => navigator.clipboard.writeText(`Subject: ${subject}\n\n${body}`).then(() => toast({ title: 'Email copied ✓' })).catch(() => toast({ variant: 'destructive', title: 'Copy failed' }))}
+        >
+          <Copy className="h-4 w-4" /> Copy
+        </button>
+      </div>
+    </div>
+  );
+}
+
 const VERDICT_CONFIG = {
   ACCEPT:  { bg: 'bg-green-600',  border: 'border-green-500',  text: 'text-green-700 dark:text-green-300',  icon: ShieldCheck,  label: '🟢 GOOD — Invoice is correct. Safe to submit.'    },
   CAUTION: { bg: 'bg-amber-500',  border: 'border-amber-400',  text: 'text-amber-700 dark:text-amber-300',  icon: AlertCircle,  label: '🟡 CHECK — Fix the flagged issues before submitting.' },
@@ -375,7 +415,7 @@ export const ResultsView = ({
             </div>
             <button
               className="text-xs text-muted-foreground flex items-center gap-1 px-3 py-2 rounded-xl border active:scale-95"
-              onClick={() => { navigator.clipboard.writeText(result.errors.map(e => e.message).join('\n')); toast({ title: 'Copied' }); }}
+              onClick={() => { navigator.clipboard.writeText(result.errors.map(e => e.message).join('\n')).catch(() => toast({ variant: 'destructive', title: 'Copy failed' })); toast({ title: 'Copied' }); }}
             >
               <Copy className="h-3 w-3" /> Copy
             </button>
@@ -421,21 +461,7 @@ export const ResultsView = ({
         </div>
       )}
 
-      {/* ── OUTSTANDING CREDIT WARNING ── */}
-      {result.isCreditSale && (result as any).hasOutstandingCredit && (
-        <div className="rounded-2xl border-2 border-red-500 bg-red-50 dark:bg-red-950/40 p-4 flex items-start gap-3">
-          <AlertOctagon className="h-7 w-7 text-red-600 flex-shrink-0" />
-          <div>
-            <p className="font-black text-red-700 dark:text-red-400 text-base">Customer Already Has Unpaid Credit!</p>
-            <p className="text-sm text-red-600 dark:text-red-300 mt-1">
-              <strong>{result.validatedData.customer_name}</strong> already owes <strong>GH¢{((result as any).outstandingCreditTotal ?? 0).toLocaleString(undefined, {minimumFractionDigits: 2})}</strong> from previous credit sales.
-            </p>
-            <p className="text-xs text-red-700 dark:text-red-400 mt-2 font-semibold">
-              → Collect the existing debt before giving more credit. Check with your manager.
-            </p>
-          </div>
-        </div>
-      )}
+
 
       {/* ── CREDIT SALE ALERT ── */}
       {result.isCreditSale && (
@@ -632,43 +658,12 @@ export const ResultsView = ({
             </span>
             {showManagerMsg ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
           </button>
-          {showManagerMsg && (() => {
-            const vendor   = editedData.customer_name || 'Unknown Vendor';
-            const invNo    = editedData.invoice_number ? `#${editedData.invoice_number}` : '(no number)';
-            const total    = editedData.total !== undefined ? editedData.total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : '?';
-            const verdictLabel = result.riskVerdict?.verdict ?? 'CAUTION';
-            const reason   = result.riskVerdict?.reason ?? 'Issues found.';
-            const problems = result.errors.slice(0, 3).map(e => e.message.split(' → ')[0]).join('\n- ');
-            const subject  = `[InvoiceGuard] ${verdictLabel} — ${vendor} Invoice ${invNo}`;
-            const body     = `Invoice Alert\n\nVerdict: ${verdictLabel}\nVendor: ${vendor}\nInvoice: ${invNo}\nTotal: ${currency} ${total}\n\nIssue: ${reason}\n\nProblems:\n- ${problems}\n\nPlease advise before payment is collected.`;
-            return (
-              <div className="px-4 pb-4 border-t border-amber-200 dark:border-amber-800 space-y-3 pt-3">
-                <div className="bg-white dark:bg-amber-950/20 border border-amber-200 rounded-xl p-3 space-y-1">
-                  <p className="text-xs font-bold text-amber-700 dark:text-amber-400">Subject</p>
-                  <p className="text-xs font-mono text-amber-900 dark:text-amber-200 leading-snug">{subject}</p>
-                  <p className="text-xs font-bold text-amber-700 dark:text-amber-400 mt-2">Body</p>
-                  <pre className="text-xs font-mono text-amber-900 dark:text-amber-200 whitespace-pre-wrap leading-snug">{body}</pre>
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    className="flex-1 h-11 rounded-xl bg-blue-600 text-white font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
-                    onClick={() => {
-                      const mailto = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-                      window.open(mailto, '_self');
-                    }}
-                  >
-                    <Send className="h-4 w-4" /> Open in Email App
-                  </button>
-                  <button
-                    className="flex-1 h-11 rounded-xl border-2 border-amber-400 text-amber-700 dark:text-amber-300 font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
-                    onClick={() => { navigator.clipboard.writeText(`Subject: ${subject}\n\n${body}`); toast({ title: 'Email copied ✓' }); }}
-                  >
-                    <Copy className="h-4 w-4" /> Copy
-                  </button>
-                </div>
-              </div>
-            );
-          })()}
+          {showManagerMsg && <ManagerEmailPanel
+            editedData={editedData}
+            result={result}
+            currency={currency}
+            toast={toast}
+          />}
         </div>
       )}
 
@@ -822,8 +817,9 @@ export const ResultsView = ({
             {/* Line items */}
             <div>
               <p className="text-sm font-semibold mb-2">Line Items</p>
-              <div className="overflow-x-auto rounded-xl border">
-                <table className="w-full min-w-[480px] text-sm">
+              <div className="overflow-x-auto -mx-4 px-4 rounded-xl">
+              <div className="border rounded-xl min-w-[420px]">
+                <table className="w-full text-sm">
                   <thead>
                     <tr className="bg-muted text-muted-foreground text-xs">
                       <th className="text-left p-2 font-medium">Item</th>
@@ -843,6 +839,7 @@ export const ResultsView = ({
                     ))}
                   </tbody>
                 </table>
+              </div>
               </div>
             </div>
 
@@ -897,15 +894,14 @@ export const ResultsView = ({
       {/* ── SHARE BUTTONS ── */}
       <div className="rounded-2xl border bg-card p-4 space-y-2">
         <p className="font-semibold text-sm flex items-center gap-2"><Share2 className="h-4 w-4 text-primary" /> Share This Invoice</p>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap sm:flex-nowrap">
           <button
             onClick={() => {
               const d = editedData;
               const total = d.total?.toLocaleString(undefined, { minimumFractionDigits: 2 }) ?? '?';
               const items = (d.items || []).map(i =>
                 `  - ${i.quantity !== undefined ? `${i.quantity}x ` : ''}${i.name || 'Item'}${i.line_total !== undefined ? ` = GH¢${i.line_total.toFixed(2)}` : ''}`
-              ).join('
-');
+              ).join('\n');
               const creditLine = result.isCreditSale
                 ? `\n\n⚠️ CREDIT SALE — Amount owed: GH¢${total}\nPayment due: ${result.dueDate || 'not set'}\nPlease pay on the agreed date.`
                 : '';
@@ -918,7 +914,7 @@ export const ResultsView = ({
                 `*Total: GH¢${total}*` +
                 creditLine;
               const url = `https://wa.me/?text=${encodeURIComponent(msg)}`;
-              window.open(url, '_blank');
+              window.open(url, '_blank', 'noopener,noreferrer');
             }}
             className="flex-1 h-11 rounded-xl border-2 border-green-500 text-green-700 dark:text-green-400 font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
           >
@@ -926,8 +922,12 @@ export const ResultsView = ({
           </button>
           <button
             onClick={async () => {
-              const usedNative = await shareNative(result, currency);
-              toast({ title: usedNative ? 'Shared!' : 'Copied to clipboard ✓' });
+              try {
+                const usedNative = await shareNative(result, currency);
+                toast({ title: usedNative ? 'Shared!' : 'Copied to clipboard ✓' });
+              } catch {
+                toast({ variant: 'destructive', title: 'Could not share', description: 'Copy the invoice details manually.' });
+              }
             }}
             className="flex-1 h-11 rounded-xl border-2 border-border font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
           >

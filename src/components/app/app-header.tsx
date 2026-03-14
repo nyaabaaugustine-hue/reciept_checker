@@ -1,6 +1,7 @@
 'use client';
 
-import { ShieldCheck, WifiOff, Settings } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { ShieldCheck, WifiOff, Settings, History } from 'lucide-react';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { Badge } from '@/components/ui/badge';
 
@@ -15,8 +16,13 @@ interface AppHeaderProps {
 export const AppHeader = ({
   isOnline = true,
   offlineQueueCount = 0,
+  onHistoryToggle,
+  historyCount = 0,
   onSettingsOpen,
-}: AppHeaderProps) => (
+}: AppHeaderProps) => {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  return (
   <header className="sticky top-0 z-30 border-b bg-card/95 backdrop-blur no-print pt-safe" role="banner">
     <div className="container mx-auto px-3 max-w-2xl lg:max-w-6xl flex items-center justify-between gap-2" style={{ minHeight: 56 }}>
       <div className="flex items-center gap-2">
@@ -36,6 +42,20 @@ export const AppHeader = ({
           </Badge>
         ) : null}
         <ThemeToggle />
+        {onHistoryToggle && (
+          <button
+            onClick={onHistoryToggle}
+            className="relative w-10 h-10 flex items-center justify-center rounded-full bg-muted active:scale-95 transition-transform"
+            aria-label="Invoice history"
+          >
+            <History className="h-5 w-5 text-muted-foreground" />
+            {mounted && historyCount > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-primary text-primary-foreground text-[10px] font-bold leading-none">
+                {historyCount > 99 ? '99+' : historyCount}
+              </span>
+            )}
+          </button>
+        )}
         {onSettingsOpen && (
           <button
             onClick={onSettingsOpen}
@@ -48,4 +68,5 @@ export const AppHeader = ({
       </div>
     </div>
   </header>
-);
+  );
+};

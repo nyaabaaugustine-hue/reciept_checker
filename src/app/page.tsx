@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { processInvoice } from '@/app/actions';
 import { useToast } from '@/hooks/use-toast';
 import { useLocalStorage } from '@/hooks/use-local-storage';
@@ -21,11 +21,13 @@ import {
   checkCustomerCreditHistory,
 } from '@/lib/invoice-intelligence';
 import { exportAllHistory, importHistory } from '@/lib/utils';
-import { Camera, Upload, History, LayoutDashboard, X } from 'lucide-react';
+import { Camera, Upload, History, LayoutDashboard, X, Mic, BarChart2, BarChart } from 'lucide-react';
 import { NewInvoiceChooser } from '@/components/app/new-invoice-chooser';
 import { ManualInvoiceModal } from '@/components/app/manual-invoice-modal';
 import { VoiceInvoiceModal } from '@/components/app/voice-invoice-modal';
 import { AIHelpModal, buildHelpFields, shouldShowHelpModal } from '@/components/app/ai-help-modal';
+import { WeeklySummary } from '@/components/app/weekly-summary';
+import { useCreditDueNotifications } from '@/hooks/use-credit-notifications';
 
 type ViewState = 'dashboard' | 'processing' | 'results';
 
@@ -70,9 +72,23 @@ export default function HomePage() {
   const [helpModalResult, setHelpModalResult] = useState<InvoiceProcessingResult | null>(null);
   const [lastImageUri, setLastImageUri] = useState<string>('');
   const [isUnlocked, setIsUnlocked] = useState(false);
+  const [showWeeklySummary, setShowWeeklySummary] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wakeLockRef = useRef<any>(null);
+  const riskAlertedRef = useRef(false);
   const { toast } = useToast();
+
+  // #8 — today's scan count
+  const todayScanCount = useMemo(() => {
+    if (!mounted) return 0;
+    const today = new Date().toDateString();
+    return history.filter(h => new Date(h.createdAt).toDateString() === today).length;
+  }, [history, mounted]);
+
+  // #3 — Credit due date push notifications
+  useCreditDueNotifications(history, (title, description) => {
+    toast({ title, description, duration: 12000 });
+  });
 
   const pinRequired = settings.pinEnabled && settings.pinHash && !isUnlocked;
 
@@ -112,13 +128,16 @@ export default function HomePage() {
   useEffect(() => {
     if (!settings.riskThreshold) return;
     const { exceeded, atRisk, threshold } = checkRiskThreshold(history, settings.riskThreshold);
-    if (exceeded) {
+    if (exceeded && !riskAlertedRef.current) {
+      riskAlertedRef.current = true;
       toast({
         variant: 'destructive',
         title: '🚨 Risk Threshold Exceeded',
         description: `${settings.currency} ${atRisk.toFixed(2)} at risk — above your ${settings.currency} ${threshold.toFixed(2)} alert threshold.`,
         duration: 12000,
       });
+    } else if (!exceeded) {
+      riskAlertedRef.current = false;
     }
   }, [history]);// eslint-disable-line react-hooks/exhaustive-deps
 
@@ -209,8 +228,9 @@ export default function HomePage() {
       } else {
         toast({ title: '🟢 ACCEPT — Safe to collect', description: verdict.reason, duration: 8000 });
       }
-      // Haptic pulse for urgent verdicts
+      // #9 — Haptic: urgent = strong pulse, ACCEPT = gentle single buzz
       if (isUrgent && 'vibrate' in navigator) navigator.vibrate([100, 50, 100, 50, 200]);
+      else if (verdict.verdict === 'ACCEPT' && 'vibrate' in navigator) navigator.vibrate(80);
     }
 
     // Secondary toasts
@@ -447,6 +467,9 @@ export default function HomePage() {
         onUploadClick={() => fileInputRef.current?.click()}
         onCameraClick={() => setIsCameraOpen(true)}
         onNewInvoiceClick={() => setShowNewInvoiceChooser(true)}
+        onWeeklyClick={() => setShowWeeklySummary(true)}
+        onHistoryToggle={handleHistoryToggle}
+        historyCount={history.length}
         isOnline={isOnline}
         offlineQueueCount={offlineQueueCount}
       />
@@ -508,24 +531,28 @@ export default function HomePage() {
                 <LayoutDashboard className="h-4 w-4 flex-shrink-0" />
                 <span className="truncate text-sm">Home</span>
               </button>
-            ) : null}
-            <button className="action-btn-secondary flex-1 min-w-0" onClick={handleHistoryToggle}>
-              <History className="h-4 w-4 flex-shrink-0" />
-              <span className="truncate text-sm">
-                History{mounted && history.length > 0 && (
-                  <span className="ml-1 bg-primary text-primary-foreground text-xs rounded-full px-1.5 py-0.5">
-                    {history.length}
+            ) : (
+              <button className="action-btn-secondary flex-1 min-w-0" onClick={() => fileInputRef.current?.click()}>
+                <Upload className="h-4 w-4 flex-shrink-0" />
+                <span className="truncate text-sm">Upload</span>
+              </button>
+            )}
+
+            {/* #5 — Voice mic directly in bar */}
+            <button className="action-btn-secondary flex-1 min-w-0" onClick={() => setShowVoiceModal(true)}>
+              <Mic className="h-4 w-4 flex-shrink-0" />
+              <span className="truncate text-sm">Voice</span>
+            </button>
+            <button className="action-btn-primary flex-1 min-w-0" onClick={() => setIsCameraOpen(true)}>
+              <span className="relative flex-shrink-0">
+                <Camera className="h-4 w-4" />
+                {mounted && todayScanCount > 0 && (
+                  <span className="absolute -top-1.5 -right-1.5 min-w-[14px] h-[14px] px-0.5 flex items-center justify-center rounded-full bg-white/40 text-white text-[9px] font-bold leading-none">
+                    {todayScanCount}
                   </span>
                 )}
               </span>
-            </button>
-            <button className="action-btn-secondary flex-1 min-w-0" onClick={() => fileInputRef.current?.click()}>
-              <Upload className="h-4 w-4 flex-shrink-0" />
-              <span className="truncate text-sm">Upload</span>
-            </button>
-            <button className="action-btn-primary flex-1 min-w-0" onClick={() => setIsCameraOpen(true)}>
-              <Camera className="h-4 w-4 flex-shrink-0" />
-              <span className="truncate text-sm">Scan</span>
+              <span className="text-sm">Scan</span>
             </button>
           </div>
         )}
@@ -597,6 +624,19 @@ export default function HomePage() {
           onExportAll={() => exportAllHistory(history, settings.salesmanName)}
           onImportAll={handleImportAll}
           historyCount={history.length}
+        />
+      )}
+
+      {/* #1 — Weekly Summary */}
+      {showWeeklySummary && (
+        <WeeklySummary
+          history={history}
+          currency={settings.currency}
+          onClose={() => setShowWeeklySummary(false)}
+          onSelectInvoice={(result) => {
+            setActiveResult(result);
+            setView('results');
+          }}
         />
       )}
     </>

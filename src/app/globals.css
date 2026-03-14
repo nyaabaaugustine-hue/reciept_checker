@@ -189,10 +189,9 @@
   }
 
   .pwa-banner {
-    @apply fixed top-0 left-0 right-0 z-50;
+    @apply fixed left-0 right-0 z-50;
     @apply bg-primary text-primary-foreground;
     @apply flex items-center justify-between gap-3 p-4;
-    padding-top: calc(16px + env(safe-area-inset-top));
     padding-bottom: 16px;
   }
 }

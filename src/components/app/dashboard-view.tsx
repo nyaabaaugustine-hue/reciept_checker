@@ -16,7 +16,7 @@ import {
 import {
   ShieldCheck, ShieldAlert, FileText, TrendingUp,
   AlertTriangle, BadgeCheck, Search, CalendarClock,
-  Package, Users, Download, Camera, Upload, Plus,
+  Package, Users, Download, Camera, Upload, Plus, BarChart2, History,
 } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 
@@ -25,6 +25,9 @@ interface DashboardViewProps {
   onUploadClick: () => void;
   onCameraClick: () => void;
   onNewInvoiceClick?: () => void;
+  onWeeklyClick?: () => void;
+  onHistoryToggle?: () => void;
+  historyCount?: number;
   isOnline?: boolean;
   offlineQueueCount?: number;
 }
@@ -68,13 +71,17 @@ function exportDailyReport(history: InvoiceProcessingResult[]) {
   const a = document.createElement('a');
   a.href = url;
   a.download = `InvoiceGuard_${report.date.replace(/\//g, '-')}.html`;
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 export const DashboardView = ({
-  history, onUploadClick, onCameraClick, onNewInvoiceClick, isOnline = true, offlineQueueCount = 0,
+  history, onUploadClick, onCameraClick, onNewInvoiceClick, onWeeklyClick, onHistoryToggle, historyCount = 0, isOnline = true, offlineQueueCount = 0,
 }: DashboardViewProps) => {
+  const [headerMounted, setHeaderMounted] = useState(false);
+  useEffect(() => setHeaderMounted(true), []);
   const [isClient, setIsClient] = useState(false);
   const [nlQuery, setNlQuery] = useState('');
   const [trendMode, setTrendMode] = useState<'weekly' | 'monthly'>('monthly');
@@ -110,20 +117,50 @@ export const DashboardView = ({
     <div className="w-full space-y-4 animate-fade-in-up">
 
       {/* Page title */}
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex items-center justify-between gap-2">
         <div>
           <h2 className="text-2xl font-bold">Dashboard</h2>
           <p className="text-muted-foreground text-sm">Every scan protects your money</p>
         </div>
-        {onNewInvoiceClick && (
-          <button
-            onClick={onNewInvoiceClick}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-violet-500 hover:bg-violet-600 active:scale-95 text-white font-bold text-sm flex-shrink-0 transition-colors"
-          >
-            <Plus className="h-4 w-4" />
-            New Invoice
-          </button>
-        )}
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          {onWeeklyClick && (
+            <button
+              onClick={onWeeklyClick}
+              className="flex items-center gap-1 px-2.5 py-2 sm:px-3 sm:py-2.5 rounded-2xl bg-muted hover:bg-muted/80 active:scale-95 font-semibold text-sm transition-colors"
+              aria-label="Weekly summary"
+            >
+              <BarChart2 className="h-4 w-4 flex-shrink-0" />
+              <span className="hidden sm:inline">Week</span>
+            </button>
+          )}
+          {onHistoryToggle && (
+            <button
+              onClick={onHistoryToggle}
+              className="relative flex items-center gap-1 px-2.5 py-2 sm:px-3 sm:py-2.5 rounded-2xl bg-muted hover:bg-muted/80 active:scale-95 font-semibold text-sm transition-colors"
+              aria-label="Invoice history"
+            >
+              <span className="relative flex-shrink-0">
+                <History className="h-4 w-4" />
+                {headerMounted && historyCount > 0 && (
+                  <span className="absolute -top-1.5 -right-1.5 min-w-[14px] h-[14px] px-0.5 flex items-center justify-center rounded-full bg-primary text-primary-foreground text-[9px] font-bold leading-none">
+                    {historyCount > 99 ? '99+' : historyCount}
+                  </span>
+                )}
+              </span>
+              <span className="hidden sm:inline">History</span>
+            </button>
+          )}
+          {onNewInvoiceClick && (
+            <button
+              onClick={onNewInvoiceClick}
+              className="flex items-center gap-1 px-2.5 py-2 sm:px-3 sm:py-2.5 rounded-2xl bg-violet-500 hover:bg-violet-600 active:scale-95 text-white font-bold text-sm transition-colors"
+              aria-label="New invoice"
+            >
+              <Plus className="h-4 w-4 flex-shrink-0" />
+              <span className="hidden sm:inline">New</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* ── OFFLINE BANNER ── */}
