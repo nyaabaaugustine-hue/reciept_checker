@@ -21,6 +21,10 @@ import {
   PackageCheck, Diff, Send,
 } from 'lucide-react';
 import { ExportMenu } from './export-menu';
+import { useContactBook } from '@/hooks/use-contact-book';
+import { useBlacklist } from '@/hooks/use-blacklist';
+import { normaliseVendorKey, detectHandwritten } from '@/lib/invoice-intelligence';
+import { Phone, PhoneCall, Ban, BookUser, MessageCircle as WA } from 'lucide-react';
 
 interface ResultsViewProps {
   result: InvoiceProcessingResult;
@@ -275,6 +279,21 @@ export const ResultsView = ({
   const isRejected = result.status === 'rejected';
   const canAct = !isApproved && !isRejected;
 
+  // Contact book & blacklist
+  const { get: getContact, upsert: upsertContact } = useContactBook();
+  const { isBlocked, get: getBlacklistEntry, add: addToBlacklist, remove: removeFromBlacklist } = useBlacklist();
+  const vendorKey = normaliseVendorKey(result.validatedData.customer_name);
+  const contact = getContact(vendorKey);
+  const blacklistEntry = getBlacklistEntry(vendorKey);
+  const blocked = isBlocked(vendorKey);
+  const [phoneInput, setPhoneInput] = useState(contact?.phone || '');
+  const [showContactEdit, setShowContactEdit] = useState(false);
+  const [blacklistReason, setBlacklistReason] = useState('');
+  const [showBlacklistInput, setShowBlacklistInput] = useState(false);
+
+  // Handwritten detection
+  const isHandwritten = detectHandwritten(result.ocrText);
+
   const verdict = result.riskVerdict?.verdict ?? (result.isValid ? 'ACCEPT' : 'REJECT');
   const verdictCfg = VERDICT_CONFIG[verdict];
   const VerdictIcon = verdictCfg.icon;
@@ -332,6 +351,164 @@ export const ResultsView = ({
             <span className="text-xs opacity-75">Reason: {result.rejectionReason}</span>
           )}
         </div>
+      </div>
+
+      {/* ── BLACKLIST WARNING ── */}
+      {blocked && blacklistEntry && (
+        <div className="rounded-2xl border-2 border-red-600 bg-red-50 dark:bg-red-950/40 p-4 flex items-start gap-3">
+          <Ban className="h-7 w-7 text-red-600 flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="font-black text-red-700 dark:text-red-400 text-base">⛔ BLACKLISTED VENDOR</p>
+            <p className="text-sm text-red-600 dark:text-red-300 mt-1">
+              <strong>{result.validatedData.customer_name}</strong> is on your blacklist.
+            </p>
+            {blacklistEntry.reason && (
+              <p className="text-xs font-mono bg-red-100 dark:bg-red-900/40 rounded-lg px-3 py-2 mt-2 text-red-800 dark:text-red-200">
+                Reason: {blacklistEntry.reason}
+              </p>
+            )}
+            <p className="text-xs text-red-700 dark:text-red-400 mt-2 font-semibold">
+              → Do NOT collect money from this vendor without manager approval.
+            </p>
+            <button
+              className="mt-3 text-xs text-red-600 underline active:opacity-70"
+              onClick={() => removeFromBlacklist(vendorKey)}
+            >
+              Remove from blacklist
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── HANDWRITTEN WARNING ── */}
+      {isHandwritten && (
+        <div className="rounded-2xl border-2 border-amber-400 bg-amber-50 dark:bg-amber-950/30 p-4 flex items-start gap-3">
+          <AlertTriangle className="h-6 w-6 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="font-black text-amber-700 dark:text-amber-400 text-base">Handwritten Invoice Detected</p>
+            <p className="text-sm text-amber-700 dark:text-amber-300 mt-1">
+              This invoice appears to be handwritten. AI reading accuracy is lower on handwritten documents — totals and item names may have errors.
+            </p>
+            <p className="text-xs text-amber-700 dark:text-amber-400 mt-2 font-semibold">
+              → Manually verify every total and item against the physical invoice before submitting.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── CONTACT BOOK PANEL ── */}
+      <div className="rounded-2xl border bg-card overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/40">
+          <div className="flex items-center gap-2">
+            <BookUser className="h-4 w-4 text-primary" />
+            <span className="font-semibold text-sm">
+              {result.validatedData.customer_name || 'Customer'} Contact
+            </span>
+          </div>
+          <button
+            className="text-xs text-primary font-semibold px-3 py-1.5 rounded-xl bg-primary/10 active:scale-95"
+            onClick={() => setShowContactEdit(v => !v)}
+          >
+            {contact?.phone ? 'Edit' : '+ Add Phone'}
+          </button>
+        </div>
+
+        {contact?.phone && !showContactEdit && (
+          <div className="px-4 py-3 flex items-center gap-3">
+            <span className="text-sm font-mono font-bold flex-1">{contact.phone}</span>
+            <a
+              href={`tel:${contact.phone}`}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-green-500 text-white text-xs font-bold active:scale-95"
+            >
+              <Phone className="h-3.5 w-3.5" /> Call
+            </a>
+            <a
+              href={`https://wa.me/${contact.phone.replace(/[^0-9]/g, '')}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-green-600 text-white text-xs font-bold active:scale-95"
+            >
+              <WA className="h-3.5 w-3.5" /> WhatsApp
+            </a>
+          </div>
+        )}
+
+        {showContactEdit && (
+          <div className="px-4 py-3 space-y-3">
+            <input
+              type="tel"
+              value={phoneInput}
+              onChange={e => setPhoneInput(e.target.value)}
+              placeholder="e.g. +233201234567"
+              className="w-full h-12 rounded-xl border-2 px-4 text-base font-mono bg-background"
+              inputMode="tel"
+            />
+            <div className="flex gap-2">
+              <button
+                className="flex-1 h-10 rounded-xl bg-primary text-primary-foreground font-bold text-sm active:scale-95"
+                onClick={() => {
+                  if (phoneInput.trim()) {
+                    upsertContact(vendorKey, result.validatedData.customer_name || 'Unknown', phoneInput);
+                    toast({ title: 'Contact saved ✓' });
+                  }
+                  setShowContactEdit(false);
+                }}
+              >
+                Save
+              </button>
+              <button
+                className="flex-1 h-10 rounded-xl border-2 border-border font-semibold text-sm active:scale-95"
+                onClick={() => setShowContactEdit(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Blacklist toggle */}
+        <div className="px-4 py-3 border-t flex items-center justify-between gap-3">
+          <span className="text-xs text-muted-foreground">
+            {blocked ? '⛔ This vendor is blacklisted' : 'Mark vendor as blocked?'}
+          </span>
+          {blocked ? (
+            <button
+              className="text-xs text-green-600 font-bold px-3 py-1.5 rounded-xl border border-green-400 active:scale-95"
+              onClick={() => removeFromBlacklist(vendorKey)}
+            >
+              Unblock
+            </button>
+          ) : (
+            <button
+              className="text-xs text-red-600 font-bold px-3 py-1.5 rounded-xl border border-red-400 active:scale-95"
+              onClick={() => setShowBlacklistInput(v => !v)}
+            >
+              Blacklist
+            </button>
+          )}
+        </div>
+        {showBlacklistInput && !blocked && (
+          <div className="px-4 pb-4 space-y-2 border-t">
+            <p className="text-xs text-muted-foreground pt-3">Reason for blacklisting (optional):</p>
+            <input
+              value={blacklistReason}
+              onChange={e => setBlacklistReason(e.target.value)}
+              placeholder="e.g. Repeated fraud, bad invoices..."
+              className="w-full h-10 rounded-xl border-2 px-3 text-sm bg-background"
+            />
+            <button
+              className="w-full h-10 rounded-xl bg-red-600 text-white font-bold text-sm active:scale-95"
+              onClick={() => {
+                addToBlacklist(vendorKey, result.validatedData.customer_name || 'Unknown', blacklistReason);
+                setShowBlacklistInput(false);
+                setBlacklistReason('');
+                toast({ title: '⛔ Vendor blacklisted', description: 'You will be warned on their next invoice.' });
+              }}
+            >
+              Confirm Blacklist
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ── HEALTH SCORE ── */}

@@ -27,6 +27,8 @@ interface DashboardViewProps {
   onNewInvoiceClick?: () => void;
   onWeeklyClick?: () => void;
   onHistoryToggle?: () => void;
+  onDebtLedgerClick?: () => void;
+  onMonthlyReportClick?: () => void;
   historyCount?: number;
   isOnline?: boolean;
   offlineQueueCount?: number;
@@ -78,7 +80,9 @@ function exportDailyReport(history: InvoiceProcessingResult[]) {
 }
 
 export const DashboardView = ({
-  history, onUploadClick, onCameraClick, onNewInvoiceClick, onWeeklyClick, onHistoryToggle, historyCount = 0, isOnline = true, offlineQueueCount = 0,
+  history, onUploadClick, onCameraClick, onNewInvoiceClick, onWeeklyClick, onHistoryToggle,
+  onDebtLedgerClick, onMonthlyReportClick,
+  historyCount = 0, isOnline = true, offlineQueueCount = 0,
 }: DashboardViewProps) => {
   const [headerMounted, setHeaderMounted] = useState(false);
   useEffect(() => setHeaderMounted(true), []);
@@ -307,13 +311,31 @@ export const DashboardView = ({
             {metrics.duplicates > 0 && (
               <p className="text-sm font-bold text-orange-700 dark:text-orange-400">🔴 {metrics.duplicates} duplicate invoice{metrics.duplicates > 1 ? 's' : ''} — do NOT collect twice</p>
             )}
-            {/* Daily report download */}
-            <button
-              className="action-btn-secondary mt-2 !min-h-[48px]"
-              onClick={() => exportDailyReport(history)}
-            >
-              <Download className="h-5 w-5" /> Download Daily Report
-            </button>
+            {/* Action buttons */}
+            <div className="grid grid-cols-1 gap-2 mt-2">
+              <button
+                className="action-btn-secondary !min-h-[48px]"
+                onClick={() => exportDailyReport(history)}
+              >
+                <Download className="h-5 w-5" /> Download Daily Report
+              </button>
+              {onMonthlyReportClick && (
+                <button
+                  className="action-btn-secondary !min-h-[48px]"
+                  onClick={onMonthlyReportClick}
+                >
+                  <Download className="h-5 w-5" /> Monthly Report
+                </button>
+              )}
+              {onDebtLedgerClick && (
+                <button
+                  className="action-btn-secondary !min-h-[48px] border-red-400 text-red-600"
+                  onClick={onDebtLedgerClick}
+                >
+                  <AlertTriangle className="h-5 w-5" /> Customer Debt Ledger
+                </button>
+              )}
+            </div>
           </CardContent>
         </Card>
       )}

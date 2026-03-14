@@ -27,7 +27,12 @@ import { ManualInvoiceModal } from '@/components/app/manual-invoice-modal';
 import { VoiceInvoiceModal } from '@/components/app/voice-invoice-modal';
 import { AIHelpModal, buildHelpFields, shouldShowHelpModal } from '@/components/app/ai-help-modal';
 import { WeeklySummary } from '@/components/app/weekly-summary';
+import { DebtLedger } from '@/components/app/debt-ledger';
+import { OnboardingModal } from '@/components/app/onboarding-modal';
 import { useCreditDueNotifications } from '@/hooks/use-credit-notifications';
+import { useBlacklist } from '@/hooks/use-blacklist';
+import { normaliseVendorKey } from '@/lib/invoice-intelligence';
+import { exportMonthlyReport } from '@/lib/monthly-report';
 
 type ViewState = 'dashboard' | 'processing' | 'results';
 
@@ -53,7 +58,13 @@ const HistorySkeletons = () => (
 export default function HomePage() {
   const [history, setHistory] = useLocalStorage<InvoiceProcessingResult[]>('invoice-history', []);
   const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  useEffect(() => {
+    setMounted(true);
+    // Show onboarding on first launch
+    if (!localStorage.getItem('invoiceguard_onboarded')) {
+      setShowOnboarding(true);
+    }
+  }, []);
   const [settings, setSettings] = useSettings();
   const [view, setView] = useState<ViewState>('dashboard');
   const [activeResult, setActiveResult] = useState<InvoiceProcessingResult | null>(null);
@@ -73,10 +84,14 @@ export default function HomePage() {
   const [lastImageUri, setLastImageUri] = useState<string>('');
   const [isUnlocked, setIsUnlocked] = useState(false);
   const [showWeeklySummary, setShowWeeklySummary] = useState(false);
+  const [showDebtLedger, setShowDebtLedger] = useState(false);
+  const [showMonthlyReportPicker, setShowMonthlyReportPicker] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wakeLockRef = useRef<any>(null);
   const riskAlertedRef = useRef(false);
   const { toast } = useToast();
+  const { isBlocked: isVendorBlocked, get: getBlacklistEntry } = useBlacklist();
 
   // #8 — today's scan count
   const todayScanCount = useMemo(() => {
@@ -257,6 +272,18 @@ export default function HomePage() {
           duration: 15000,
         });
       }
+    }
+
+    // Blacklist check — warn after scan
+    const scannedVendorKey = normaliseVendorKey(result.validatedData.customer_name);
+    if (isVendorBlocked(scannedVendorKey)) {
+      const entry = getBlacklistEntry(scannedVendorKey);
+      toast({
+        variant: 'destructive',
+        title: `⛔ BLACKLISTED: ${result.validatedData.customer_name}`,
+        description: entry?.reason || 'This vendor is on your blacklist. Do not collect money without manager approval.',
+        duration: 15000,
+      });
     }
 
     setHistory(prev => [result, ...prev]);
@@ -469,6 +496,11 @@ export default function HomePage() {
         onNewInvoiceClick={() => setShowNewInvoiceChooser(true)}
         onWeeklyClick={() => setShowWeeklySummary(true)}
         onHistoryToggle={handleHistoryToggle}
+        onDebtLedgerClick={() => setShowDebtLedger(true)}
+        onMonthlyReportClick={() => {
+          const now = new Date();
+          exportMonthlyReport(history, now.getMonth(), now.getFullYear(), settings.currency, settings.salesmanName);
+        }}
         historyCount={history.length}
         isOnline={isOnline}
         offlineQueueCount={offlineQueueCount}
@@ -627,7 +659,7 @@ export default function HomePage() {
         />
       )}
 
-      {/* #1 — Weekly Summary */}
+      {/* Weekly Summary */}
       {showWeeklySummary && (
         <WeeklySummary
           history={history}
@@ -636,6 +668,31 @@ export default function HomePage() {
           onSelectInvoice={(result) => {
             setActiveResult(result);
             setView('results');
+            setShowWeeklySummary(false);
+          }}
+        />
+      )}
+
+      {/* Debt Ledger */}
+      {showDebtLedger && (
+        <DebtLedger
+          history={history}
+          currency={settings.currency}
+          onClose={() => setShowDebtLedger(false)}
+          onSelectInvoice={(result) => {
+            setActiveResult(result);
+            setView('results');
+            setShowDebtLedger(false);
+          }}
+        />
+      )}
+
+      {/* Onboarding — first launch only */}
+      {showOnboarding && (
+        <OnboardingModal
+          onDone={() => {
+            localStorage.setItem('invoiceguard_onboarded', '1');
+            setShowOnboarding(false);
           }}
         />
       )}

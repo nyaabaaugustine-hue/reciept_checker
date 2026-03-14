@@ -929,6 +929,46 @@ export function checkIdenticalTotalCrossVendor(
 // ─────────────────────────────────────────────────────────────
 // #I20 — SALESMAN-READABLE SUMMARY LINE
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// HANDWRITTEN INVOICE DETECTOR
+// Heuristics: inconsistent line lengths, absence of structured
+// patterns, certain OCR artifact strings common in handwriting.
+// ─────────────────────────────────────────────────────────────
+export function detectHandwritten(ocrText: string | undefined): boolean {
+  if (!ocrText || ocrText.length < 30) return false;
+  const text = ocrText.toLowerCase();
+
+  // Strong positive signals — words OCR engines emit for handwriting
+  const handwrittenKeywords = [
+    'handwritten', 'hand written', 'hand-written',
+    'manual entry', 'written by hand',
+  ];
+  if (handwrittenKeywords.some(k => text.includes(k))) return true;
+
+  const lines = ocrText.split('\n').filter(l => l.trim().length > 0);
+  if (lines.length < 3) return false;
+
+  // Heuristic 1: highly irregular line lengths (std-dev > 60% of mean)
+  const lengths = lines.map(l => l.trim().length);
+  const mean = lengths.reduce((a, b) => a + b, 0) / lengths.length;
+  const stdDev = Math.sqrt(lengths.reduce((a, b) => a + (b - mean) ** 2, 0) / lengths.length);
+  const highVariance = mean > 5 && stdDev / mean > 0.85;
+
+  // Heuristic 2: very few numbers (typed invoices are number-dense)
+  const digitCount = (ocrText.match(/\d/g) || []).length;
+  const charCount = ocrText.replace(/\s/g, '').length;
+  const lowNumberDensity = charCount > 50 && digitCount / charCount < 0.05;
+
+  // Heuristic 3: absence of common typed-invoice keywords
+  const typedKeywords = ['invoice', 'receipt', 'total', 'subtotal', 'vat', 'tax', 'qty', 'unit price', 'amount'];
+  const typedKeywordCount = typedKeywords.filter(k => text.includes(k)).length;
+  const fewTypedKeywords = typedKeywordCount < 2;
+
+  // Need at least 2 of 3 heuristics to flag as handwritten
+  const signals = [highVariance, lowNumberDensity, fewTypedKeywords].filter(Boolean).length;
+  return signals >= 2;
+}
+
 export function buildSalesmanSummary(result: InvoiceProcessingResult): string {
   const v = result.validatedData;
   const vendor  = v.customer_name || 'Unknown Vendor';
