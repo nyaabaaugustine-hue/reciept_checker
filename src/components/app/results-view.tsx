@@ -19,12 +19,13 @@ import {
   Share2, MessageCircle, Calculator, ShieldCheck,
   Ban, AlertCircle, TrendingUp, Lightbulb,
   PackageCheck, Diff, Send,
+  MessageCircle as WA,
 } from 'lucide-react';
 import { ExportMenu } from './export-menu';
 import { useContactBook } from '@/hooks/use-contact-book';
 import { useBlacklist } from '@/hooks/use-blacklist';
 import { normaliseVendorKey, detectHandwritten } from '@/lib/invoice-intelligence';
-import { Phone, PhoneCall, Ban, BookUser, MessageCircle as WA } from 'lucide-react';
+import { Phone, PhoneCall, BookUser } from 'lucide-react';
 
 interface ResultsViewProps {
   result: InvoiceProcessingResult;

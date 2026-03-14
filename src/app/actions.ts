@@ -584,6 +584,23 @@ Common labels (copy WHATEVER is written): Subtotal, Net Amount, NHIL, GETFund, C
 
 CRITICAL: If NO tax rows exist — that is normal. Many companies include VAT in product prices. List only what is actually on the document.
 
+GRA FORM C — CRITICAL READING RULES (applies when you see "Ghana Revenue Authority" or "GRA" on the document):
+GRA Form C has a specific 7-row structure in the totals section. Read it EXACTLY as follows:
+  Row (i)   "Tax Exclusive Value"          -> this is the SUBTOTAL (pre-tax base). It equals the sum of all line item amounts.
+  Row (ii)  "NHIL (2.5%)"                  -> this is 2.5% of row (i). It is a LEVY amount, NOT the subtotal.
+  Row (iii) "GETFund Levy (2.5%)"          -> this is 2.5% of row (i). It is a LEVY amount, NOT the subtotal.
+  Row (iv)  "COVID-19 Levy (1%)"           -> this is 1% of row (i). It is a LEVY amount.
+  Row (v)   "Total Levy Inclusive Value"   -> this is row (i) + row (ii) + row (iii) + row (iv). It may be blacked out or missing.
+  Row (vi)  "VAT (15%)"                    -> this is 15% of row (v). It is the VAT amount.
+  Row (vii) "Total Tax Inclusive Value"    -> this is the GRAND TOTAL = row (v) + row (vi).
+
+COMMON GRA MISREAD ERROR — PREVENT THIS:
+  The NHIL amount (row ii) and GETFund amount (row iii) look similar to the subtotal (row i) on many handwritten GRA forms.
+  NHIL = 2.5% of subtotal. If subtotal were 12.94, NHIL would only be 0.32 — but if NHIL shows 12.94, the real subtotal must be 12.94/0.025 = 517.60.
+  RULE: The value in row (i) Tax Exclusive Value IS the subtotal. The values in rows (ii), (iii), (iv) are levy amounts calculated FROM the subtotal. They will always be SMALLER than the subtotal.
+  If rows (ii) and (i) show the same number — you have misread one of them. Row (i) is the large number (e.g. 517.64). Row (ii) is the small number (e.g. 12.94).
+  On GRA Form C, the Amount column for rows (ii), (iii), (iv) is often BLACKED OUT or printed as a dark box — only the unit price column contains the levy values. Read from whichever column has visible numbers.
+
 STEP 5 — ZONE D: FINAL PAYABLE:
 GRAND TOTAL AMOUNT: [exact final amount or NONE]
 GRAND TOTAL LABEL: [exact label]
@@ -720,10 +737,22 @@ ${mathContext}
 EXTRACTION RULES:
 
 1. NULL RULE: NONE or "?" -> null. NEVER invent.
-2. TOTAL RULE: "total" = final payable. For GRA: row (vii).
+2. TOTAL RULE: "total" = final payable. For GRA: row (vii) "Total Tax Inclusive Value".
 3. VAT/TAX RULE: Only set tax fields if EXPLICITLY on document. If absent -> vat_included_in_prices: true, all tax fields null.
-4. SUBTOTAL RULE: null if no explicit subtotal row.
+4. SUBTOTAL RULE: For GRA Form C invoices, subtotal = row (i) "Tax Exclusive Value" (the PRE-TAX base, largest number before levies). NEVER use the NHIL or GETFund amount as the subtotal.
 5. VENDOR RULE: "customer_name" = SELLER/VENDOR at top.
+
+GRA FORM C EXTRACTION RULES (critical — apply when is_gra_invoice=true):
+- subtotal = row (i) Tax Exclusive Value. This is the BASE amount = sum of all item line totals.
+- nhil    = row (ii) NHIL amount = 2.5% of subtotal. This will always be MUCH SMALLER than subtotal.
+- getfund = row (iii) GETFund amount = 2.5% of subtotal.
+- covid_levy = row (iv) COVID-19 Levy = 1% of subtotal.
+- vat    = row (vi) VAT (15%) amount.
+- total  = row (vii) Total Tax Inclusive Value = grand total.
+- SANITY CHECK: nhil should be approximately subtotal * 0.025. If nhil equals subtotal, you have misread the subtotal — the real subtotal is nhil / 0.025.
+- The Amount column for rows (ii)(iii)(iv) on GRA Form C is printed as a DARK/BLACK BOX — those values appear only in the unit-price/levy column, not the amount column. Extract them from wherever they are visible.
+- vat_included_in_prices: false (GRA invoices always show tax separately).
+- is_gra_invoice: true.
 6. CONFIDENCE: "high"=clear, "medium"=partially visible, "low"=uncertain/blurry.
 7. CHARACTER CONFIDENCE: If any digit in a number had "?" -> set that field's confidence to "low".
 8. ITEM RULE: copy names exactly — abbreviations, spelling, shorthand preserved.
@@ -983,6 +1012,21 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
     }
   }
 
+  // ── GRA SUBTOTAL MISREAD RECOVERY ──
+  // Runs before tax derivation so the correct subtotal is used throughout.
+  // If is_gra_invoice=true and nhil ≈ subtotal (within 1%), the AI read the NHIL
+  // levy amount as the Tax Exclusive Value. Real subtotal = nhil / 0.025.
+  let correctedSubtotalValue = subtotal; // will be updated if recovery fires
+  if (ai.is_gra_invoice === true && nhilSafe !== undefined && subtotal !== undefined && subtotal > 0) {
+    const ratio = nhilSafe / subtotal;
+    if (Math.abs(ratio - 1.0) < 0.02) { // within 2% — definitely a misread
+      correctedSubtotalValue = Math.round((nhilSafe / 0.025) * 100) / 100;
+      console.log(`[MathEngine] GRA subtotal misread: AI=${subtotal}, NHIL=${nhilSafe} -> corrected subtotal=${correctedSubtotalValue}`);
+      mathNotes.push(`GRA subtotal auto-corrected: ${subtotal.toFixed(2)} -> ${correctedSubtotalValue.toFixed(2)} (NHIL ${nhilSafe.toFixed(2)} ÷ 2.5%)`);
+    }
+  }
+  const effectiveSubtotal = correctedSubtotalValue; // use this everywhere below
+
   // Step 5: tax derivation — ONLY runs when vatIncluded is false
   let correctedTax: number | undefined = undefined;
   if (!vatIncluded && taxExplicitlyPresent) {
@@ -1000,20 +1044,19 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
         correctedTax = aiTaxSafe;
       }
     } else {
-      // Only aiTax present (no breakdown) — use it directly
       correctedTax = aiTaxSafe;
     }
 
     // Step 6: GRA levy rate verification (ONLY for confirmed GRA invoices with levies)
-    if (ai.is_gra_invoice === true && subtotal && subtotal > 0 && hasGraLevies) {
-      const expectedNhil    = Math.round(subtotal * 0.025 * 100) / 100;
-      const expectedGetfund = Math.round(subtotal * 0.025 * 100) / 100;
-      const expectedCovid   = Math.round(subtotal * 0.010 * 100) / 100;
-      const levyBase        = safeSum(subtotal, nhilSafe ?? expectedNhil, getfundSafe ?? expectedGetfund, covidSafe ?? expectedCovid);
+    if (ai.is_gra_invoice === true && effectiveSubtotal && effectiveSubtotal > 0 && hasGraLevies) {
+      const expectedNhil    = Math.round(effectiveSubtotal * 0.025 * 100) / 100;
+      const expectedGetfund = Math.round(effectiveSubtotal * 0.025 * 100) / 100;
+      const expectedCovid   = Math.round(effectiveSubtotal * 0.010 * 100) / 100;
+      const levyBase        = safeSum(effectiveSubtotal, nhilSafe ?? expectedNhil, getfundSafe ?? expectedGetfund, covidSafe ?? expectedCovid);
       const expectedVat     = Math.round(levyBase * 0.15 * 100) / 100;
 
       if (nhilSafe !== undefined && Math.abs(nhilSafe - expectedNhil) > 0.15)
-        mathErrors.push(`NHIL error: shows ${nhilSafe.toFixed(2)}, expected ${expectedNhil.toFixed(2)} (2.5% of ${subtotal.toFixed(2)}). -> Ask vendor to correct NHIL.`);
+        mathErrors.push(`NHIL error: shows ${nhilSafe.toFixed(2)}, expected ${expectedNhil.toFixed(2)} (2.5% of ${effectiveSubtotal.toFixed(2)}). -> Ask vendor to correct NHIL.`);
       if (getfundSafe !== undefined && Math.abs(getfundSafe - expectedGetfund) > 0.15)
         mathErrors.push(`GETFund error: shows ${getfundSafe.toFixed(2)}, expected ${expectedGetfund.toFixed(2)}. -> Ask vendor to correct GETFund.`);
       if (covidSafe !== undefined && Math.abs(covidSafe - expectedCovid) > 0.15)
@@ -1021,14 +1064,14 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
       if (vatSafe !== undefined && Math.abs(vatSafe - expectedVat) > 1.50)
         mathErrors.push(`VAT error: shows ${vatSafe.toFixed(2)}, expected ${expectedVat.toFixed(2)} (15% of levy base ${levyBase.toFixed(2)}). -> Ask vendor to correct VAT.`);
 
-      runningTotalChain.push(`Subtotal (pre-tax): ${subtotal.toFixed(2)}`);
+      runningTotalChain.push(`Subtotal (pre-tax): ${effectiveSubtotal.toFixed(2)}`);
       if (nhilSafe !== undefined) runningTotalChain.push(`+ NHIL 2.5%: ${nhilSafe.toFixed(2)}`);
       if (getfundSafe !== undefined) runningTotalChain.push(`+ GETFund 2.5%: ${getfundSafe.toFixed(2)}`);
       if (covidSafe !== undefined) runningTotalChain.push(`+ COVID-19 Levy 1%: ${covidSafe.toFixed(2)}`);
       if (vatSafe !== undefined) runningTotalChain.push(`+ VAT 15%: ${vatSafe.toFixed(2)}`);
       if (aiTotal !== undefined) runningTotalChain.push(`= Grand Total: ${aiTotal.toFixed(2)}`);
-    } else if (subtotal !== undefined && correctedTax !== undefined) {
-      runningTotalChain.push(`Subtotal: ${subtotal.toFixed(2)}`);
+    } else if (effectiveSubtotal !== undefined && correctedTax !== undefined) {
+      runningTotalChain.push(`Subtotal: ${effectiveSubtotal.toFixed(2)}`);
       runningTotalChain.push(`+ Tax: ${correctedTax.toFixed(2)}`);
       if (aiTotal !== undefined) runningTotalChain.push(`= Total: ${aiTotal.toFixed(2)}`);
     }
@@ -1110,7 +1153,7 @@ function runMathEngine(ai: any, mathCheck?: any): MathResult {
     }
   }
 
-  return { correctedSubtotal: subtotal, correctedTax, correctedTotal, mathOverride, mathNotes, mathErrors, mathSuggestions, runningTotalChain, vatIncluded };
+  return { correctedSubtotal: effectiveSubtotal, correctedTax, correctedTotal, mathOverride, mathNotes, mathErrors, mathSuggestions, runningTotalChain, vatIncluded };
 }
 
 // -----------------------------------------------------------------
