@@ -58,13 +58,18 @@ export function detectDuplicate(
     ) return { isDuplicate: true, duplicateOfId: h.id, crossCustomer: false };
 
     // NEW: same invoice number across DIFFERENT customers — flag as cross-customer duplicate
-    // Salesmen sometimes reuse invoice books so same number appears for different customers
+    // Only fires when this vendor has 3+ invoices on record (sequential numbering from 001
+    // is common for new vendors, so we avoid false positives on early invoices).
+    const vendorInvoiceCount = history.filter(
+      h2 => normaliseVendorKey(h2.validatedData.customer_name) === vendorKey
+    ).length;
     if (
       invNo &&
       h.validatedData.invoice_number === invNo &&
       hVendorKey !== vendorKey &&
       hVendorKey !== '__unknown__' &&
-      vendorKey !== '__unknown__'
+      vendorKey !== '__unknown__' &&
+      vendorInvoiceCount >= 3
     ) return { isDuplicate: true, duplicateOfId: h.id, crossCustomer: true };
 
     // NEW: same total + same date + today = strong same-day duplicate signal
@@ -432,11 +437,16 @@ export function calcHealthScore(result: InvoiceProcessingResult): number {
   if (d.tax === undefined) score -= 5;
   score -= Math.min(result.errors.length * 10, 30);
   if (result.isDuplicate) score -= 25;
+  // Risk verdict penalty — a passing OCR score shouldn't hide a REJECT/ESCALATE verdict
+  if (result.riskVerdict?.verdict === 'REJECT') score -= 30;
+  else if (result.riskVerdict?.verdict === 'ESCALATE') score -= 20;
+  else if (result.riskVerdict?.verdict === 'CAUTION') score -= 10;
   return Math.max(0, score);
 }
 
 export function healthScoreBreakdown(result: InvoiceProcessingResult): Array<{ label: string; deduction: number; ok: boolean }> {
   const d = result.validatedData;
+  const verdict = result.riskVerdict?.verdict;
   return [
     { label: 'Invoice number present', deduction: 15, ok: !!d.invoice_number },
     { label: 'Customer name present', deduction: 15, ok: !!d.customer_name },
@@ -447,6 +457,7 @@ export function healthScoreBreakdown(result: InvoiceProcessingResult): Array<{ l
     { label: 'Tax present', deduction: 5, ok: d.tax !== undefined },
     { label: 'No validation errors', deduction: Math.min(result.errors.length * 10, 30), ok: result.errors.length === 0 },
     { label: 'Not a duplicate', deduction: 25, ok: !result.isDuplicate },
+    { label: 'Risk verdict: ACCEPT', deduction: verdict === 'REJECT' ? 30 : verdict === 'ESCALATE' ? 20 : verdict === 'CAUTION' ? 10 : 0, ok: !verdict || verdict === 'ACCEPT' },
   ];
 }
 

@@ -69,6 +69,7 @@ export default function HomePage() {
   const [view, setView] = useState<ViewState>('dashboard');
   const [activeResult, setActiveResult] = useState<InvoiceProcessingResult | null>(null);
   const [processingStatus, setProcessingStatus] = useState<string | null>(null);
+  const [processingQualityScore, setProcessingQualityScore] = useState<number | null>(null);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showHistoryLoading, setShowHistoryLoading] = useState(false);
@@ -181,8 +182,11 @@ export default function HomePage() {
   const submitImage = async (imageUri: string): Promise<InvoiceProcessingResult | null> => {
     setView('processing');
     setProcessingStatus('Checking image quality…');
+    setProcessingQualityScore(null);
 
     const quality = await checkImageQuality(imageUri);
+    // Show the quality score on the processing screen as soon as we have it
+    if (quality.qualityScore != null) setProcessingQualityScore(quality.qualityScore);
     if (!quality.ok) {
       setView('dashboard');
       // Block the scan completely — show retake screen
@@ -475,7 +479,7 @@ export default function HomePage() {
   };
 
   const renderMain = () => {
-    if (view === 'processing') return <ProcessingView statusMessage={processingStatus} />;
+    if (view === 'processing') return <ProcessingView statusMessage={processingStatus} qualityScore={processingQualityScore} />;
     if (view === 'results' && activeResult) return (
       <ResultsView
         result={activeResult}
@@ -508,7 +512,17 @@ export default function HomePage() {
     );
   };
 
-  if (pinRequired) return <PinLockScreen pinHash={settings.pinHash} onUnlock={() => setIsUnlocked(true)} />;
+  if (pinRequired) return <PinLockScreen
+    pinHash={settings.pinHash}
+    onUnlock={() => setIsUnlocked(true)}
+    onForgotPin={() => {
+      if (confirm('This will remove your PIN lock. Are you sure?')) {
+        setSettings(prev => ({ ...prev, pinEnabled: false, pinHash: '' }));
+        setIsUnlocked(true);
+        toast({ title: '🔓 PIN removed. You can set a new one in Settings.' });
+      }
+    }}
+  />;
 
   return (
     <>
@@ -656,6 +670,7 @@ export default function HomePage() {
           onExportAll={() => exportAllHistory(history, settings.salesmanName)}
           onImportAll={handleImportAll}
           historyCount={history.length}
+          onShowOnboarding={() => setShowOnboarding(true)}
         />
       )}
 

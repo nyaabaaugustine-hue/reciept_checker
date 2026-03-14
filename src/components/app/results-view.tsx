@@ -4,7 +4,7 @@ import { useState, useMemo } from 'react';
 import type { InvoiceProcessingResult, ValidatedData } from '@/lib/types';
 import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
-import { calcHealthScore, healthLabel, daysUntilDue, dueDateStatus } from '@/lib/invoice-intelligence';
+import { calcHealthScore, healthLabel, healthScoreBreakdown, daysUntilDue, dueDateStatus } from '@/lib/invoice-intelligence';
 import { shareViaWhatsApp, shareNative } from '@/lib/utils';
 import { HealthScoreBadge } from './health-score-badge';
 

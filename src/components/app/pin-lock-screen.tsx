@@ -7,9 +7,10 @@ import { ShieldCheck, Eye, EyeOff } from 'lucide-react';
 interface PinLockScreenProps {
   pinHash: string;
   onUnlock: () => void;
+  onForgotPin?: () => void;
 }
 
-export const PinLockScreen = ({ pinHash, onUnlock }: PinLockScreenProps) => {
+export const PinLockScreen = ({ pinHash, onUnlock, onForgotPin }: PinLockScreenProps) => {
   const [pin, setPin] = useState('');
   const [showPin, setShowPin] = useState(false);
   const [error, setError] = useState('');
@@ -66,6 +67,16 @@ export const PinLockScreen = ({ pinHash, onUnlock }: PinLockScreenProps) => {
         {/* Error */}
         {error && (
           <p className="text-sm text-destructive font-semibold -mt-4">{error}</p>
+        )}
+
+        {/* Forgot PIN */}
+        {onForgotPin && (
+          <button
+            onClick={onForgotPin}
+            className="text-xs text-muted-foreground underline underline-offset-2 -mt-4"
+          >
+            Forgot PIN? Reset (clears PIN lock)
+          </button>
         )}
 
         {/* Dial pad */}

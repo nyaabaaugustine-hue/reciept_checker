@@ -18,9 +18,10 @@ interface SettingsPanelProps {
   onExportAll: () => void;
   onImportAll: (file: File) => void;
   historyCount: number;
+  onShowOnboarding?: () => void;
 }
 
-export const SettingsPanel = ({ onClose, onExportAll, onImportAll, historyCount }: SettingsPanelProps) => {
+export const SettingsPanel = ({ onClose, onExportAll, onImportAll, historyCount, onShowOnboarding }: SettingsPanelProps) => {
   const [settings, setSettings] = useSettings();
   const { toast } = useToast();
   const [newCategory, setNewCategory] = useState('');
@@ -236,6 +237,9 @@ export const SettingsPanel = ({ onClose, onExportAll, onImportAll, historyCount 
               >
                 <Unlock className="h-4 w-4" /> Disable PIN
               </button>
+              <p className="text-xs text-muted-foreground text-center mt-1">
+                Forgotten your PIN? Disable it here, then re-enable with a new one.
+              </p>
             </div>
           ) : (
             <div className="space-y-3">
@@ -319,8 +323,16 @@ export const SettingsPanel = ({ onClose, onExportAll, onImportAll, historyCount 
           </div>
         </section>
 
-        {/* ── RESET ── */}
+        {/* ── HELP & RESET ── */}
         <section className="space-y-3">
+          {onShowOnboarding && (
+            <button
+              onClick={() => { onShowOnboarding(); onClose(); }}
+              className="w-full h-11 rounded-xl border-2 border-border font-bold text-sm flex items-center justify-center gap-2 active:scale-95"
+            >
+              📖 View App Tutorial Again
+            </button>
+          )}
           <button
             onClick={() => {
               setSettings(DEFAULT_SETTINGS);

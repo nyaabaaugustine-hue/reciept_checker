@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import type { InvoiceProcessingResult } from '@/lib/types';
 import {
   buildTrendData, topVendors, topItems,
@@ -88,6 +88,8 @@ export const DashboardView = ({
   useEffect(() => setHeaderMounted(true), []);
   const [isClient, setIsClient] = useState(false);
   const [nlQuery, setNlQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [trendMode, setTrendMode] = useState<'weekly' | 'monthly'>('monthly');
 
   useEffect(() => { setIsClient(true); }, []);
@@ -109,11 +111,11 @@ export const DashboardView = ({
   const cleanRate = metrics.count > 0 ? Math.round(((metrics.clean + metrics.approved) / metrics.count) * 100) : 100;
   const overdueInvoices = useMemo(() => history.filter(inv => dueDateStatus(daysUntilDue(inv.dueDate)) === 'overdue'), [history]);
   const dueSoonInvoices = useMemo(() => history.filter(inv => dueDateStatus(daysUntilDue(inv.dueDate)) === 'due-soon'), [history]);
-  const searchResults = useMemo(() => nlQuery.trim().length > 1 ? nlSearch(nlQuery, history) : null, [nlQuery, history]);
+  const searchResults = useMemo(() => debouncedQuery.trim().length > 1 ? nlSearch(debouncedQuery, history) : null, [debouncedQuery, history]);
   const trendData = useMemo(() => buildTrendData(history, trendMode), [history, trendMode]);
   const vendorData = useMemo(() => topVendors(history, 5), [history]);
   const itemData = useMemo(() => topItems(history, 5), [history]);
-  const categoryData = Object.entries(metrics.byCategory).map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount);
+  const categoryData = useMemo(() => Object.entries(metrics.byCategory).map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount), [metrics.byCategory]);
 
   const fmt = (n: number) => n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -347,9 +349,13 @@ export const DashboardView = ({
             <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-muted-foreground" />
             <Input
               className="pl-11 h-14 text-base rounded-2xl"
-              placeholder='Search: "errors", "over 5000", "Groceries"...'
+              placeholder='Search: "over 5000", "January", "Groceries", "approved"...'
               value={nlQuery}
-              onChange={e => setNlQuery(e.target.value)}
+              onChange={e => {
+                setNlQuery(e.target.value);
+                if (debounceRef.current) clearTimeout(debounceRef.current);
+                debounceRef.current = setTimeout(() => setDebouncedQuery(e.target.value), 220);
+              }}
             />
           </div>
           {searchResults !== null && (

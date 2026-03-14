@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo } from 'react';
-import { X, AlertOctagon, CalendarClock, PhoneCall, TrendingUp } from 'lucide-react';
+import { X, AlertOctagon, CalendarClock, TrendingUp } from 'lucide-react';
 import type { InvoiceProcessingResult } from '@/lib/types';
 import { normaliseVendorKey, daysUntilDue, dueDateStatus } from '@/lib/invoice-intelligence';
 
@@ -148,10 +148,10 @@ export function DebtLedger({ history, currency, onClose, onSelectInvoice }: Debt
                                 <p className="text-xs font-medium text-muted-foreground">
                                   #{inv.validatedData.invoice_number || '—'} · {new Date(inv.createdAt).toLocaleDateString()}
                                 </p>
-                                {inv.dueDate && (
+                                {inv.dueDate && days !== null && (
                                   <p className={`text-xs font-semibold flex items-center gap-1 mt-0.5 ${dStatus === 'overdue' ? 'text-red-500' : dStatus === 'due-soon' ? 'text-amber-500' : 'text-muted-foreground'}`}>
                                     <CalendarClock className="h-3 w-3" />
-                                    {dStatus === 'overdue' ? `${Math.abs(days!)}d overdue` : dStatus === 'due-soon' ? `Due in ${days}d` : `Due ${new Date(inv.dueDate).toLocaleDateString()}`}
+                                    {dStatus === 'overdue' ? `${Math.abs(days)}d overdue` : dStatus === 'due-soon' ? `Due in ${days}d` : `Due ${new Date(inv.dueDate).toLocaleDateString()}`}
                                   </p>
                                 )}
                               </div>

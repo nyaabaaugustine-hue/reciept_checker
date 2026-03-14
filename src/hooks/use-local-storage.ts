@@ -21,10 +21,19 @@ export function useLocalStorage<T>(key: string, initialValue: T): [T, (value: T 
       const valueToStore = value instanceof Function ? value(storedValue) : value;
       setStoredValue(valueToStore);
       if (typeof window !== 'undefined') {
-        window.localStorage.setItem(key, JSON.stringify(valueToStore));
+        try {
+          window.localStorage.setItem(key, JSON.stringify(valueToStore));
+        } catch (storageError: any) {
+          // QuotaExceededError — storage full (common with base64 image queue)
+          if (storageError?.name === 'QuotaExceededError' || storageError?.code === 22) {
+            console.warn(`[useLocalStorage] Storage quota exceeded for key "${key}". Data saved in memory only.`);
+          } else {
+            console.error('[useLocalStorage] Write error:', storageError);
+          }
+        }
       }
     } catch (error) {
-      console.error(error);
+      console.error('[useLocalStorage] Unexpected error:', error);
     }
   }, [key, storedValue]);
   

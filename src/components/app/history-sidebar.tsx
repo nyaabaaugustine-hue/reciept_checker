@@ -158,7 +158,7 @@ export const HistorySidebar = ({ history, onSelect, onClear, isOpen, inline = fa
                     <div className="flex items-center gap-2 flex-wrap">
                       {isOverdue && (
                         <Badge variant="destructive" className="text-xs flex items-center gap-1 h-5 px-1.5">
-                          <CalendarClock className="h-3 w-3" /> {Math.abs(dueDays!)}d overdue
+                        <CalendarClock className="h-3 w-3" /> {dueDays !== null ? Math.abs(dueDays) : 0}d overdue
                         </Badge>
                       )}
                       {isDueSoon && (
