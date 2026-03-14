@@ -1,14 +1,21 @@
 /**
- * intelligence.ts
- * Core analysis engine powering features:
- * #1  Duplicate invoice detector
- * #4  Vendor consistency check
- * #5  Tax rate validator
- * #10 Date anomaly check
- * #39 Smart invoice naming
- * #40 Recurring invoice detection
- * #43 Invoice health score
+ * intelligence.ts — DEPRECATED
+ *
+ * This file has been superseded by invoice-intelligence.ts which contains
+ * richer, Ghana-aware versions of every function here.
+ *
+ * All imports throughout the codebase use invoice-intelligence.ts.
+ * This file is kept temporarily as a tombstone and will be removed.
+ *
+ * DO NOT ADD NEW CODE HERE.
+ * DO NOT IMPORT FROM THIS FILE.
  */
+
+// Re-export everything from the canonical source so any accidental
+// import of this file still resolves correctly during transition.
+export * from './invoice-intelligence';
+
+// ── original code below is intentionally left for git history ──
 
 import type { InvoiceProcessingResult, RecurringPattern, ValidationError } from './types';
 

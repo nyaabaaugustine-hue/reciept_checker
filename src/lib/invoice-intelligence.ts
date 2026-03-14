@@ -1,5 +1,9 @@
 /**
- * invoice-intelligence.ts — InvoiceGuard AI v7.0
+ * invoice-intelligence.ts — InvoiceGuard AI v7.0  [CANONICAL SOURCE]
+ *
+ * This is the ONLY intelligence file. intelligence.ts is deprecated and
+ * re-exports from here. Import only from this file.
+ *
  * Built for field salesmen. Language reflects collecting/receiving money, not paying.
  *
  * v7.0 Improvements:
